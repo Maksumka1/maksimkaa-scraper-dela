@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS cargo_history (
     price_uah NUMERIC(10, 2),
     price_per_km_uah NUMERIC(8, 2),
     published_relative VARCHAR(64),
+    order_url TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 

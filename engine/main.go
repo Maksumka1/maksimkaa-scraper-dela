@@ -88,6 +88,7 @@ type CargoPayload struct {
 	RequestID         string
 	RouteFrom         string
 	RouteTo           string
+	OrderURL          string
 	RouteFromFull     string
 	RouteToFull       string
 	RouteFromRegion   string
@@ -183,6 +184,7 @@ func parsePayload(vals map[string]interface{}) (*CargoPayload, error) {
 		RequestID:         getString("request_id"),
 		RouteFrom:         getString("route_from"),
 		RouteTo:           getString("route_to"),
+		OrderURL:          getString("order_url"),
 		RouteFromFull:     getString("route_from_full"),
 		RouteToFull:       getString("route_to_full"),
 		RouteFromRegion:   getString("route_from_region"),
@@ -593,11 +595,12 @@ func saveBatchToPostgres(ctx context.Context, db *pgxpool.Pool, items []*CargoPa
 	batch := &pgx.Batch{}
 	query := `
 		INSERT INTO cargo_history (
-			request_id, route_from, route_to, route_from_full, route_to_full,
+			request_id, route_from, route_to, order_url, route_from_full, route_to_full,
 			route_from_region, route_to_region, cargo_type, tags, transport_types,
 			distance_km, weight_t, volume_m3, price_uah, price_per_km_uah, published_relative
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (request_id) DO UPDATE SET
+			order_url = EXCLUDED.order_url,
 			route_from_full = EXCLUDED.route_from_full,
 			route_to_full = EXCLUDED.route_to_full,
 			route_from_region = EXCLUDED.route_from_region,
@@ -611,6 +614,7 @@ func saveBatchToPostgres(ctx context.Context, db *pgxpool.Pool, items []*CargoPa
 			c.RequestID,
 			c.RouteFrom,
 			c.RouteTo,
+			c.OrderURL,
 			c.RouteFromFull,
 			c.RouteToFull,
 			c.RouteFromRegion,
@@ -814,6 +818,11 @@ func formatAlert(c *CargoPayload) string {
 	if len(c.TransportTypes) > 0 {
 		text += fmt.Sprintf("🚛 Транспорт: %s\n", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
 	}
+
+	if c.OrderURL != "" {
+		text += fmt.Sprintf("🔗 <a href=\"%s\">Відкрити замовлення на Della</a>\n", escapeTelegramHTML(c.OrderURL))
+	}
+
 	text += fmt.Sprintf("⏱ %s", escapeTelegramHTML(c.PublishedRelative))
 	return text
 }

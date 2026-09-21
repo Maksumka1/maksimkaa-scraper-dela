@@ -181,6 +181,9 @@ func formatReturnCandidates(candidates []*CargoPayload) string {
 		if len(c.TransportTypes) > 0 {
 			fmt.Fprintf(&b, "\n🚛 %s", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
 		}
+		if c.OrderURL != "" {
+			fmt.Fprintf(&b, "\n🔗 <a href=\"%s\">Відкрити замовлення</a>", escapeTelegramHTML(c.OrderURL))
+		}
 		if c.PublishedRelative != "" {
 			fmt.Fprintf(&b, "\n⏱ %s", escapeTelegramHTML(c.PublishedRelative))
 		}
@@ -255,12 +258,18 @@ func formatRoundTripAlert(forward *CargoPayload, returns []*CargoPayload) string
 	fmt.Fprintf(&b, "➡️ <b>Туди:</b> %s ➔ %s (%d км)\n", escapeTelegramHTML(forward.RouteFrom), escapeTelegramHTML(forward.RouteTo), forward.DistanceKm)
 	fmt.Fprintf(&b, "Вантаж: %s | %.1f т | %.1f м³\n", escapeTelegramHTML(forward.CargoType), forward.WeightT, forward.VolumeM3)
 	fmt.Fprintf(&b, "💰 %.0f грн (%.2f грн/км)\n", forward.PriceUAH, forward.PricePerKmUAH)
+	if forward.OrderURL != "" {
+		fmt.Fprintf(&b, "🔗 <a href=\"%s\">Відкрити замовлення</a>\n", escapeTelegramHTML(forward.OrderURL))
+	}
 
 	b.WriteString("\n🔄 <b>Назад:</b>\n")
 	for i, candidate := range returns {
 		fmt.Fprintf(&b, "\n<b>%d.</b> %s ➔ %s (%d км)\n", i+1, escapeTelegramHTML(candidate.RouteFrom), escapeTelegramHTML(candidate.RouteTo), candidate.DistanceKm)
 		fmt.Fprintf(&b, "%s | %.1f т | %.1f м³\n", escapeTelegramHTML(candidate.CargoType), candidate.WeightT, candidate.VolumeM3)
 		fmt.Fprintf(&b, "💰 %.0f грн (%.2f грн/км)", candidate.PriceUAH, candidate.PricePerKmUAH)
+		if candidate.OrderURL != "" {
+			fmt.Fprintf(&b, "\n🔗 <a href=\"%s\">Відкрити замовлення</a>", escapeTelegramHTML(candidate.OrderURL))
+		}
 		if len(candidate.TransportTypes) > 0 {
 			fmt.Fprintf(&b, "\n🚛 %s", escapeTelegramHTML(strings.Join(candidate.TransportTypes, ", ")))
 		}

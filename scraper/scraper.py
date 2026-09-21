@@ -56,6 +56,7 @@ class CargoRequest:
     route_to_region: str = ""
     tags: List[str] = field(default_factory=list)
     transport_types: List[str] = field(default_factory=list)
+    order_url: str = ""
     parsed_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -550,6 +551,17 @@ class DellaMobileScraper:
                     route_to_region,
                 ) = self._extract_geo_context(locality_nodes[1])
 
+            order_url = ""
+            link_nodes = card.xpath(
+                './/a[contains(concat(" ", normalize-space(@class), " "), " request_distance ")]/@href'
+            )
+            if link_nodes:
+                href = link_nodes[0].strip()
+                if href.startswith("/"):
+                    order_url = f"https://della.ua{href}"
+                elif href.startswith("https://della.ua/"):
+                    order_url = href
+
             dist_node = card.xpath(
                 './/a[contains(concat(" ", normalize-space(@class), " "), " distance ")]//text()'
             )
@@ -625,6 +637,7 @@ class DellaMobileScraper:
                     published_relative=time_str,
                     route_from=route_from,
                     route_to=route_to,
+                    order_url=order_url,
                     route_from_full=route_from_full,
                     route_to_full=route_to_full,
                     route_from_region=route_from_region,

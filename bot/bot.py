@@ -298,7 +298,7 @@ def build_archive_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
         clauses.append(f"transport_types && ${len(args)}::text[]")
 
     query = f"""
-        SELECT route_from, route_to, route_from_full, route_to_full,
+        SELECT route_from, route_to, order_url,route_from_full, route_to_full,
                route_from_region, route_to_region, distance_km, cargo_type,
                weight_t, volume_m3, price_uah, price_per_km_uah,
                transport_types, published_relative, created_at
@@ -319,6 +319,12 @@ def format_archive_row(row: asyncpg.Record) -> str:
     ]
     if transport:
         lines.append(f"🚛 {html.escape(', '.join(str(x) for x in transport))}")
+
+    if row["order_url"]:
+        lines.append(
+            f'🔗 <a href="{html.escape(str(row["order_url"], quote=True))}">Відкрити замовлення на Della</a>'
+        )
+    
     lines.append(f"⏱ {html.escape(str(row['published_relative'] or ''))}")
     return "\n".join(lines)
 
