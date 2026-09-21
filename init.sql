@@ -1,7 +1,7 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS cargo_history (
-    request_id VARCHAR(128) PRIMARY KEY,
+    request_id VARCHAR(512) PRIMARY KEY,
     route_from VARCHAR(100) NOT NULL,
     route_to VARCHAR(100) NOT NULL,
     cargo_type VARCHAR(150),

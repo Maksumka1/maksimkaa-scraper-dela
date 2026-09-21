@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+import hashlib
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -132,7 +133,7 @@ class AdaptiveRateLimiter:
                 self.current_interval * 0.8,
                 self.min_interval,
             )
-            logger.info(
+            logger.debug(
                 f"[RateLimiter] Нові дані. "
                 f"{old:.1f}s -> {self.current_interval:.1f}s"
             )
@@ -501,9 +502,12 @@ class DellaMobileScraper:
             )
             tags = [" ".join(t.split()) for t in tag_nodes if t.strip()]
 
+            raw_fingerprint = f"{route_from}_{route_to}_{dist_km}_{weight_val}_{volume_val}_{price_val}_{cargo_desc}_{dateup_ts}"
+            stable_req_id = hashlib.sha256(raw_fingerprint.encode("utf-8")).hexdigest()
+
             results.append(
                 CargoRequest(
-                    request_id=req_id,
+                    request_id=stable_req_id,
                     dateup_timestamp=dateup_ts,
                     published_relative=time_str,
                     route_from=route_from,
@@ -608,14 +612,6 @@ class DellaMobileScraper:
         )
         self.metrics.current_interval_sec = self.rate_limiter.current_interval
 
-        logger.info(
-            "[Fetch OK] Отримано: %s заявок | "
-            "Latency: %.1fms | Наст. пауза: %.1fs",
-            len(items),
-            latency_ms,
-            self.rate_limiter.current_interval,
-        )
-
         return items
 
     def fetch_once(self) -> List[CargoRequest]:
@@ -625,13 +621,6 @@ class DellaMobileScraper:
         items = self._fetch_http_once()
         new_items = self._filter_new_items(items)
         self.metrics.unique_items_seen = len(self._seen_ids)
-
-        logger.info(
-            "[Dedup] Snapshot: %s | Нових: %s | У кеші: %s",
-            len(items),
-            len(new_items),
-            len(self._seen_ids),
-        )
         return new_items
 
     def run_forever(self):
@@ -639,9 +628,12 @@ class DellaMobileScraper:
 
         while True:
             started = time.monotonic()
+            new_count = 0
 
             try:
                 new_items = self.fetch_new_once()
+                new_count = len(new_items)
+
                 for item in new_items:
                     payload = item.to_redis_payload()
                     redis_client.xadd(
@@ -650,7 +642,6 @@ class DellaMobileScraper:
                         maxlen=20000,
                         approximate=True,
                     )
-                    logger.info(f"[Stream Push] Вантаж {item.request_id} надіслано в Redis")
             except KeyboardInterrupt:
                 logger.info("Зупинка парсера.")
                 break
@@ -662,6 +653,16 @@ class DellaMobileScraper:
             delay = max(0.0, target_interval - elapsed)
 
             self.metrics.current_interval_sec = self.rate_limiter.current_interval
+
+            # Зведений статус за ітерацію
+            logger.info(
+                f"[Status] Пауза: {delay:.1f}s (базова: {self.rate_limiter.current_interval:.1f}s) | "
+                f"Нових: {new_count} | "
+                f"У кеші: {self.metrics.unique_items_seen} | "
+                f"Всього оброблено: {self.metrics.items_extracted} | "
+                f"Запитів: {self.metrics.total_requests} | "
+                f"Avg latency: {self.metrics.avg_response_time_ms:.1f}ms"
+            )
 
             if delay > 0:
                 time.sleep(delay)
