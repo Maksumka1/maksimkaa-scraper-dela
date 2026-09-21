@@ -21,13 +21,32 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+const filterSchemaVersion = 2
+
 type UserFilter struct {
-	ChatID        int64
-	RouteFrom     string
-	RouteTo       string
+	ChatID int64
+
+	// Legacy fields. They remain supported for zero-downtime rollout and old /set filters.
+	RouteFrom string
+	RouteTo   string
+
+	FromAllUkraine bool
+	FromCities     []string
+	FromRegions    []string
+	ToAllUkraine   bool
+	ToCities       []string
+	ToRegions      []string
+
 	MinWeight     float64
+	MaxWeight     float64
+	MinVolume     float64
+	MaxVolume     float64
 	MinPricePerKm float64
-	Enabled       bool
+
+	TransportTypes      []string
+	ReturnSearchEnabled bool
+	RoundTripOnly       bool
+	Enabled             bool
 }
 
 type FilterStore struct {
@@ -69,7 +88,13 @@ type CargoPayload struct {
 	RequestID         string
 	RouteFrom         string
 	RouteTo           string
+	RouteFromFull     string
+	RouteToFull       string
+	RouteFromRegion   string
+	RouteToRegion     string
 	CargoType         string
+	Tags              []string
+	TransportTypes    []string
 	DistanceKm        int
 	WeightT           float64
 	VolumeM3          float64
@@ -92,6 +117,54 @@ type TelegramAPIResponse struct {
 	} `json:"parameters"`
 }
 
+func parseStringSlice(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		log.Printf("Некоректний JSON-масив фільтра: %v", err)
+		return nil
+	}
+
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = normalizeFilterValue(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func parseFloatField(data map[string]string, key string) float64 {
+	value := strings.TrimSpace(data[key])
+	if value == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed < 0 {
+		return 0
+	}
+	return parsed
+}
+
+func parseBoolField(data map[string]string, key string) bool {
+	value := strings.ToLower(strings.TrimSpace(data[key]))
+	return value == "1" || value == "true" || value == "yes"
+}
+
+func normalizeFilterValue(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
+}
+
 func parsePayload(vals map[string]interface{}) (*CargoPayload, error) {
 	getString := func(k string) string {
 		if v, ok := vals[k].(string); ok {
@@ -110,7 +183,13 @@ func parsePayload(vals map[string]interface{}) (*CargoPayload, error) {
 		RequestID:         getString("request_id"),
 		RouteFrom:         getString("route_from"),
 		RouteTo:           getString("route_to"),
+		RouteFromFull:     getString("route_from_full"),
+		RouteToFull:       getString("route_to_full"),
+		RouteFromRegion:   getString("route_from_region"),
+		RouteToRegion:     getString("route_to_region"),
 		CargoType:         getString("cargo_type"),
+		Tags:              parseStringSlice(getString("tags")),
+		TransportTypes:    parseStringSlice(getString("transport_types")),
 		DistanceKm:        dist,
 		WeightT:           weight,
 		VolumeM3:          vol,
@@ -187,46 +266,104 @@ func main() {
 				}
 
 				var toSave []*CargoPayload
-				var ackIDs []string
+				var pendingMsgIDs []string
+				var immediateAckIDs []string
 
 				for _, msg := range entries[0].Messages {
-					ackIDs = append(ackIDs, msg.ID)
 					cargo, err := parsePayload(msg.Values)
 					if err != nil || cargo.RequestID == "" {
+						// A malformed record cannot be processed successfully later.
+						immediateAckIDs = append(immediateAckIDs, msg.ID)
 						continue
 					}
 
 					seenKey := fmt.Sprintf("cargo:seen:%s", cargo.RequestID)
-					wasSet, _ := rdb.SetNX(ctx, seenKey, 1, 48*time.Hour).Result()
-					if !wasSet {
+					exists, err := rdb.Exists(ctx, seenKey).Result()
+					if err != nil {
+						log.Printf("Помилка перевірки dedup Redis для %s: %v", cargo.RequestID, err)
+						continue
+					}
+					if exists > 0 {
+						immediateAckIDs = append(immediateAckIDs, msg.ID)
 						continue
 					}
 
 					toSave = append(toSave, cargo)
+					pendingMsgIDs = append(pendingMsgIDs, msg.ID)
+				}
+
+				if len(immediateAckIDs) > 0 {
+					if err := rdb.XAck(ctx, streamKey, groupName, immediateAckIDs...).Err(); err != nil {
+						log.Printf("Помилка XAck для вже оброблених записів: %v", err)
+					}
+				}
+
+				if len(toSave) == 0 {
+					continue
+				}
+
+				if err := saveBatchToPostgres(ctx, dbPool, toSave); err != nil {
+					// Do not ACK/mark seen: Redis Stream will redeliver the records.
+					log.Printf("Помилка запису в Postgres: %v. Повідомлення залишено для повторної обробки", err)
+					continue
+				}
+
+				ackAfterSave := make([]string, 0, len(pendingMsgIDs))
+				for i, cargo := range toSave {
+					seenKey := fmt.Sprintf("cargo:seen:%s", cargo.RequestID)
+					wasSet, err := rdb.SetNX(ctx, seenKey, 1, 48*time.Hour).Result()
+					if err != nil {
+						log.Printf("Не вдалося позначити cargo=%s як seen: %v. Повторна обробка дозволена", cargo.RequestID, err)
+						continue
+					}
+					ackAfterSave = append(ackAfterSave, pendingMsgIDs[i])
+					if !wasSet {
+						continue
+					}
 
 					for _, f := range store.GetAll() {
-						if match(cargo, f) {
-							select {
-							case tgQueue <- TelegramTask{
-								ChatID: f.ChatID,
-								Text:   formatAlert(cargo),
-							}:
-							default:
-								log.Printf("Головна черга переповнена, пропуск для %d", f.ChatID)
+						if !match(cargo, f) {
+							continue
+						}
+
+						text := formatAlert(cargo)
+						var returnCandidates []*CargoPayload
+						if f.ReturnSearchEnabled || f.RoundTripOnly {
+							candidates, err := findReturnCargo(ctx, dbPool, cargo, f, 5)
+							if err != nil {
+								log.Printf("Помилка пошуку зворотного вантажу для %s: %v", cargo.RequestID, err)
+								continue
 							}
+							if f.RoundTripOnly {
+								returnCandidates, err = recordNewRoundTripPairs(ctx, dbPool, f.ChatID, cargo.RequestID, candidates)
+								if err != nil {
+									log.Printf("Помилка запису round-trip pair для %s/%d: %v", cargo.RequestID, f.ChatID, err)
+									continue
+								}
+								if len(returnCandidates) == 0 {
+									continue
+								}
+								text = formatRoundTripAlert(cargo, returnCandidates)
+							} else {
+								returnCandidates = candidates
+								text += formatReturnCandidates(returnCandidates)
+							}
+						}
+
+						select {
+						case tgQueue <- TelegramTask{ChatID: f.ChatID, Text: text}:
+						default:
+							log.Printf("Головна черга переповнена, пропуск для %d", f.ChatID)
 						}
 					}
 				}
 
-				if len(toSave) > 0 {
-					if err := saveBatchToPostgres(ctx, dbPool, toSave); err != nil {
-						log.Printf("Помилка запису в Postgres: %v", err)
+				if len(ackAfterSave) > 0 {
+					if err := rdb.XAck(ctx, streamKey, groupName, ackAfterSave...).Err(); err != nil {
+						log.Printf("Помилка XAck після збереження: %v", err)
 					}
 				}
 
-				if len(ackIDs) > 0 {
-					rdb.XAck(ctx, streamKey, groupName, ackIDs...)
-				}
 			}
 		}
 	}()
@@ -380,18 +517,37 @@ func sendHTTPRequest(
 	}
 }
 
+func historyRetentionDays() int {
+	const defaultRetentionDays = 180
+	raw := strings.TrimSpace(os.Getenv("CARGO_HISTORY_RETENTION_DAYS"))
+	if raw == "" {
+		return defaultRetentionDays
+	}
+	days, err := strconv.Atoi(raw)
+	if err != nil || days < 48/24 || days > 3650 {
+		log.Printf("Некоректний CARGO_HISTORY_RETENTION_DAYS=%q; використовую %d", raw, defaultRetentionDays)
+		return defaultRetentionDays
+	}
+	return days
+}
+
 func startDataRetentionWorker(ctx context.Context, db *pgxpool.Pool) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
+	retentionDays := historyRetentionDays()
 	batchQuery := `
 		WITH to_delete AS (
 			SELECT request_id FROM cargo_history
-			WHERE created_at < NOW() - INTERVAL '48 HOURS'
+			WHERE created_at < $1
 			LIMIT 1000
 		)
 		DELETE FROM cargo_history
 		WHERE request_id IN (SELECT request_id FROM to_delete);
+	`
+	pairCleanupQuery := `
+		DELETE FROM round_trip_pairs
+		WHERE created_at < $1;
 	`
 
 	for {
@@ -399,6 +555,7 @@ func startDataRetentionWorker(ctx context.Context, db *pgxpool.Pool) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			cutoff := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
 			totalDeleted := int64(0)
 			for {
 				select {
@@ -407,7 +564,7 @@ func startDataRetentionWorker(ctx context.Context, db *pgxpool.Pool) {
 				default:
 				}
 
-				res, err := db.Exec(ctx, batchQuery)
+				res, err := db.Exec(ctx, batchQuery, cutoff)
 				if err != nil {
 					log.Printf("Помилка батч-очищення: %v", err)
 					break
@@ -423,7 +580,10 @@ func startDataRetentionWorker(ctx context.Context, db *pgxpool.Pool) {
 			}
 
 			if totalDeleted > 0 {
-				log.Printf("Очищення історії: видалено %d застарілих записів", totalDeleted)
+				log.Printf("Очищення історії: видалено %d застарілих записів (retention=%d днів)", totalDeleted, retentionDays)
+			}
+			if _, err := db.Exec(ctx, pairCleanupQuery, cutoff); err != nil {
+				log.Printf("Помилка очищення round-trip pairs: %v", err)
 			}
 		}
 	}
@@ -433,14 +593,38 @@ func saveBatchToPostgres(ctx context.Context, db *pgxpool.Pool, items []*CargoPa
 	batch := &pgx.Batch{}
 	query := `
 		INSERT INTO cargo_history (
-			request_id, route_from, route_to, cargo_type, distance_km, 
-			weight_t, volume_m3, price_uah, price_per_km_uah, published_relative
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (request_id) DO NOTHING;
+			request_id, route_from, route_to, route_from_full, route_to_full,
+			route_from_region, route_to_region, cargo_type, tags, transport_types,
+			distance_km, weight_t, volume_m3, price_uah, price_per_km_uah, published_relative
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		ON CONFLICT (request_id) DO UPDATE SET
+			route_from_full = EXCLUDED.route_from_full,
+			route_to_full = EXCLUDED.route_to_full,
+			route_from_region = EXCLUDED.route_from_region,
+			route_to_region = EXCLUDED.route_to_region,
+			tags = EXCLUDED.tags,
+			transport_types = EXCLUDED.transport_types;
 	`
+
 	for _, c := range items {
-		batch.Queue(query, c.RequestID, c.RouteFrom, c.RouteTo, c.CargoType, c.DistanceKm,
-			c.WeightT, c.VolumeM3, c.PriceUAH, c.PricePerKmUAH, c.PublishedRelative)
+		batch.Queue(query,
+			c.RequestID,
+			c.RouteFrom,
+			c.RouteTo,
+			c.RouteFromFull,
+			c.RouteToFull,
+			c.RouteFromRegion,
+			c.RouteToRegion,
+			c.CargoType,
+			c.Tags,
+			c.TransportTypes,
+			c.DistanceKm,
+			c.WeightT,
+			c.VolumeM3,
+			c.PriceUAH,
+			c.PricePerKmUAH,
+			c.PublishedRelative,
+		)
 	}
 
 	br := db.SendBatch(ctx, batch)
@@ -451,37 +635,219 @@ func saveBatchToPostgres(ctx context.Context, db *pgxpool.Pool, items []*CargoPa
 			return err
 		}
 	}
+
+	// geo_locations is intentionally maintained by the Go persistence layer.
+	// The scraper remains responsible only for extracting source data.
+	geoBatch := &pgx.Batch{}
+	geoQuery := `
+		INSERT INTO geo_locations (city_name, district_name, region_name)
+		VALUES ($1, NULLIF($2, ''), $3)
+		ON CONFLICT (city_name, region_name) DO UPDATE SET
+			district_name = COALESCE(EXCLUDED.district_name, geo_locations.district_name),
+			updated_at = NOW();
+	`
+
+	type geoKey struct {
+		city   string
+		region string
+	}
+	seenGeo := make(map[geoKey]struct{})
+	for _, c := range items {
+		addGeo := func(city, full, region string) {
+			city = strings.TrimSpace(city)
+			region = strings.TrimSpace(region)
+			if city == "" || region == "" {
+				return
+			}
+
+			district := ""
+			if comma := strings.Index(full, ","); comma > 0 {
+				district = strings.TrimSpace(full[:comma])
+			}
+
+			key := geoKey{city: normalizeFilterValue(city), region: normalizeFilterValue(region)}
+			if _, exists := seenGeo[key]; exists {
+				return
+			}
+			seenGeo[key] = struct{}{}
+			geoBatch.Queue(geoQuery, city, district, region)
+		}
+
+		addGeo(c.RouteFrom, c.RouteFromFull, c.RouteFromRegion)
+		addGeo(c.RouteTo, c.RouteToFull, c.RouteToRegion)
+	}
+
+	if len(seenGeo) > 0 {
+		geoResult := db.SendBatch(ctx, geoBatch)
+		defer geoResult.Close()
+		for range seenGeo {
+			if _, err := geoResult.Exec(); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
 func match(c *CargoPayload, f *UserFilter) bool {
-	if f.RouteFrom != "" && !strings.Contains(strings.ToLower(c.RouteFrom), f.RouteFrom) {
+	if !locationMatches(
+		c.RouteFrom,
+		c.RouteFromFull,
+		c.RouteFromRegion,
+		f.FromAllUkraine,
+		f.FromCities,
+		f.FromRegions,
+		f.RouteFrom,
+	) {
 		return false
 	}
-	if f.RouteTo != "" && !strings.Contains(strings.ToLower(c.RouteTo), f.RouteTo) {
+
+	if !locationMatches(
+		c.RouteTo,
+		c.RouteToFull,
+		c.RouteToRegion,
+		f.ToAllUkraine,
+		f.ToCities,
+		f.ToRegions,
+		f.RouteTo,
+	) {
 		return false
 	}
+
 	if f.MinWeight > 0 && c.WeightT < f.MinWeight {
 		return false
+	}
+	if f.MaxWeight > 0 {
+		if c.WeightT <= 0 || c.WeightT > f.MaxWeight {
+			return false
+		}
+	}
+	if f.MinVolume > 0 && c.VolumeM3 < f.MinVolume {
+		return false
+	}
+	if f.MaxVolume > 0 {
+		if c.VolumeM3 <= 0 || c.VolumeM3 > f.MaxVolume {
+			return false
+		}
 	}
 	if f.MinPricePerKm > 0 && c.PricePerKmUAH < f.MinPricePerKm {
 		return false
 	}
+	if len(f.TransportTypes) > 0 && !hasTransportIntersection(c.TransportTypes, f.TransportTypes) {
+		return false
+	}
+
 	return true
 }
 
+func locationMatches(
+	city string,
+	full string,
+	region string,
+	allUkraine bool,
+	cities []string,
+	regions []string,
+	legacy string,
+) bool {
+	if allUkraine {
+		return true
+	}
+
+	if len(cities) == 0 && len(regions) == 0 && legacy == "" {
+		return true
+	}
+
+	normalizedCity := normalizeFilterValue(city)
+	normalizedFull := normalizeFilterValue(full)
+	normalizedRegion := normalizeFilterValue(region)
+
+	for _, target := range cities {
+		if normalizedCity == normalizeFilterValue(target) {
+			return true
+		}
+	}
+
+	for _, target := range regions {
+		normalizedTarget := normalizeFilterValue(target)
+		if normalizedRegion == normalizedTarget {
+			return true
+		}
+		// Defensive fallback for old cargo rows where only route_*_full exists.
+		if normalizedTarget != "" && strings.Contains(normalizedFull, normalizedTarget) {
+			return true
+		}
+	}
+
+	// Backward compatibility with the original scalar substring matching.
+	if legacy != "" && strings.Contains(normalizedCity, normalizeFilterValue(legacy)) {
+		return true
+	}
+
+	return false
+}
+
+func hasTransportIntersection(cargoTypes, filterTypes []string) bool {
+	cargoSet := make(map[string]struct{}, len(cargoTypes))
+	for _, value := range cargoTypes {
+		cargoSet[normalizeFilterValue(value)] = struct{}{}
+	}
+	for _, value := range filterTypes {
+		if _, ok := cargoSet[normalizeFilterValue(value)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func formatAlert(c *CargoPayload) string {
-	return fmt.Sprintf(
+	text := fmt.Sprintf(
 		"⚡️ <b>Новий вантаж!</b>\n\n"+
 			"📍 <b>%s ➔ %s</b> (%d км)\n"+
 			"Вантаж: %s | %.1f т | %.1f м³\n"+
-			"💰 <b>%.0f грн</b> (<b>%.2f грн/км</b>)\n"+
-			"⏱ %s",
-		c.RouteFrom, c.RouteTo, c.DistanceKm,
-		c.CargoType, c.WeightT, c.VolumeM3,
+			"💰 <b>%.0f грн</b> (<b>%.2f грн/км</b>)\n",
+		escapeTelegramHTML(c.RouteFrom), escapeTelegramHTML(c.RouteTo), c.DistanceKm,
+		escapeTelegramHTML(c.CargoType), c.WeightT, c.VolumeM3,
 		c.PriceUAH, c.PricePerKmUAH,
-		c.PublishedRelative,
 	)
+
+	if len(c.TransportTypes) > 0 {
+		text += fmt.Sprintf("🚛 Транспорт: %s\n", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
+	}
+	text += fmt.Sprintf("⏱ %s", escapeTelegramHTML(c.PublishedRelative))
+	return text
+}
+
+func buildUserFilter(chatID int64, data map[string]string) *UserFilter {
+	if rawVersion := strings.TrimSpace(data["schema_version"]); rawVersion != "" {
+		version, err := strconv.Atoi(rawVersion)
+		if err == nil && version > filterSchemaVersion {
+			log.Printf("Фільтр %d має новішу schema_version=%d; застосовано відомі поля", chatID, version)
+		}
+	}
+
+	filter := &UserFilter{
+		ChatID:              chatID,
+		RouteFrom:           normalizeFilterValue(data["route_from"]),
+		RouteTo:             normalizeFilterValue(data["route_to"]),
+		FromAllUkraine:      parseBoolField(data, "from_all_ukraine"),
+		FromCities:          parseStringSlice(data["from_cities"]),
+		FromRegions:         parseStringSlice(data["from_regions"]),
+		ToAllUkraine:        parseBoolField(data, "to_all_ukraine"),
+		ToCities:            parseStringSlice(data["to_cities"]),
+		ToRegions:           parseStringSlice(data["to_regions"]),
+		MinWeight:           parseFloatField(data, "min_weight"),
+		MaxWeight:           parseFloatField(data, "max_weight"),
+		MinVolume:           parseFloatField(data, "min_volume"),
+		MaxVolume:           parseFloatField(data, "max_volume"),
+		MinPricePerKm:       parseFloatField(data, "min_price_km"),
+		TransportTypes:      parseStringSlice(data["transport_types"]),
+		ReturnSearchEnabled: parseBoolField(data, "return_search_enabled"),
+		RoundTripOnly:       parseBoolField(data, "round_trip_only"),
+		Enabled:             parseBoolField(data, "enabled"),
+	}
+
+	return filter
 }
 
 func loadFilters(ctx context.Context, rdb *redis.Client, store *FilterStore) {
@@ -490,19 +856,13 @@ func loadFilters(ctx context.Context, rdb *redis.Client, store *FilterStore) {
 		return
 	}
 	for _, chatIDStr := range users {
-		chatID, _ := strconv.ParseInt(chatIDStr, 10, 64)
+		chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+		if err != nil {
+			continue
+		}
 		data, err := rdb.HGetAll(ctx, fmt.Sprintf("filter:%d", chatID)).Result()
 		if err == nil && len(data) > 0 {
-			weight, _ := strconv.ParseFloat(data["min_weight"], 64)
-			price, _ := strconv.ParseFloat(data["min_price_km"], 64)
-			store.Set(&UserFilter{
-				ChatID:        chatID,
-				RouteFrom:     data["route_from"],
-				RouteTo:       data["route_to"],
-				MinWeight:     weight,
-				MinPricePerKm: price,
-				Enabled:       data["enabled"] == "1",
-			})
+			store.Set(buildUserFilter(chatID, data))
 		}
 	}
 }
@@ -516,22 +876,19 @@ func watchFilterUpdates(ctx context.Context, rdb *redis.Client, store *FilterSto
 		select {
 		case <-ctx.Done():
 			return
-		case msg := <-ch:
-			chatID, _ := strconv.ParseInt(msg.Payload, 10, 64)
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			chatID, err := strconv.ParseInt(msg.Payload, 10, 64)
+			if err != nil {
+				continue
+			}
 			data, err := rdb.HGetAll(ctx, fmt.Sprintf("filter:%d", chatID)).Result()
 			if err != nil || len(data) == 0 {
 				store.Delete(chatID)
 			} else {
-				weight, _ := strconv.ParseFloat(data["min_weight"], 64)
-				price, _ := strconv.ParseFloat(data["min_price_km"], 64)
-				store.Set(&UserFilter{
-					ChatID:        chatID,
-					RouteFrom:     data["route_from"],
-					RouteTo:       data["route_to"],
-					MinWeight:     weight,
-					MinPricePerKm: price,
-					Enabled:       data["enabled"] == "1",
-				})
+				store.Set(buildUserFilter(chatID, data))
 			}
 		}
 	}

@@ -50,7 +50,12 @@ class CargoRequest:
     volume_m3: Optional[float]
     price_uah: Optional[int]
     price_per_km_uah: Optional[float]
+    route_from_full: str = ""
+    route_to_full: str = ""
+    route_from_region: str = ""
+    route_to_region: str = ""
     tags: List[str] = field(default_factory=list)
+    transport_types: List[str] = field(default_factory=list)
     parsed_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -58,6 +63,9 @@ class CargoRequest:
     def to_redis_payload(self) -> Dict[str, str]:
         data = asdict(self)
         data["tags"] = json.dumps(data["tags"], ensure_ascii=False)
+        data["transport_types"] = json.dumps(
+            data["transport_types"], ensure_ascii=False
+        )
         return {k: str(v) if v is not None else "" for k, v in data.items()}
 
 
@@ -269,6 +277,89 @@ class DellaMobileScraper:
         return " ".join(" ".join(node.xpath(".//text()")).split())
 
     @staticmethod
+    def _normalize_region_name(region: str) -> str:
+        value = " ".join((region or "").split()).strip(" ,")
+        value = re.sub(r"\s+область$", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+обл\.?$", "", value, flags=re.IGNORECASE)
+        return value.strip(" ,")
+
+    @classmethod
+    def _extract_geo_context(cls, locality_node) -> tuple[str, str, str]:
+        """Return (full_title, district, region) for a Della locality node."""
+        titles = locality_node.xpath(
+            './ancestor-or-self::span[@title][1]/@title'
+        )
+        full_title = " ".join(titles[0].split()) if titles else ""
+
+        district_name = ""
+        region_name = ""
+        if full_title and "," in full_title:
+            district_name = full_title.split(",", 1)[0].strip()
+            tail = full_title.split(",", 1)[1]
+            match = re.search(
+                r"(?P<region>[^,]+?)\s+(?:обл\.?|область)(?=\s*$|,)",
+                tail,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                region_name = cls._normalize_region_name(match.group("region"))
+
+        return full_title, district_name, region_name
+
+    @staticmethod
+    def _normalize_transport_type(value: str) -> str:
+        normalized = " ".join((value or "").lower().split())
+        aliases = (
+            ("ізотерм", "ізотерм"),
+            ("изотерм", "ізотерм"),
+            ("рефриж", "рефрижератор"),
+            ("зерновоз", "зерновоз"),
+            ("щеповоз", "щеповоз"),
+            ("самоскид", "самоскид"),
+            ("цистерн", "цистерна"),
+            ("контейнеровоз", "контейнеровоз"),
+            ("низькорам", "низькорамник"),
+            ("платформ", "платформа"),
+            ("маніпулятор", "маніпулятор"),
+            ("манипулятор", "маніпулятор"),
+            ("тент", "тент"),
+            ("крита", "крита"),
+            ("крытая", "крита"),
+            ("автовоз", "автовоз"),
+            ("автобус", "автобус"),
+        )
+        for marker, canonical in aliases:
+            if marker in normalized:
+                return canonical
+        return ""
+
+    @classmethod
+    def _extract_transport_types(cls, card, tags: List[str]) -> List[str]:
+        candidates = list(tags)
+        candidates.extend(
+            card.xpath(
+                './/*[contains(concat(" ", normalize-space(@class), " "), " truck_type ")]//text()'
+                ' | .//*[contains(concat(" ", normalize-space(@class), " "), " transport_type ")]//text()'
+                ' | .//*[contains(concat(" ", normalize-space(@class), " "), " vehicle_type ")]//text()'
+                ' | .//*[contains(concat(" ", normalize-space(@class), " "), " body_type ")]//text()'
+                ' | .//*[@data-truck_type]/@data-truck_type'
+            )
+        )
+
+        # Della visibly exposes the vehicle/body type per cargo card. The
+        # explicit selectors above cover common semantic class/data-attribute
+        # variants; tags remain a fallback for the current parser structure.
+        transport_types = []
+        seen = set()
+        for candidate in candidates:
+            canonical = cls._normalize_transport_type(candidate)
+            if canonical and canonical not in seen:
+                seen.add(canonical)
+                transport_types.append(canonical)
+
+        return transport_types
+
+    @staticmethod
     def _is_captcha_page(response) -> bool:
         if response.status_code == 200 and len(response.text) > 10000:
             return False
@@ -430,13 +521,34 @@ class DellaMobileScraper:
             )
             time_str = " ".join(" ".join(time_node).split()) if time_node else ""
 
-            localities = card.xpath(
+            locality_nodes = card.xpath(
                 './/div[contains(concat(" ", normalize-space(@class), " "), " request_route ")]'
-                '//span[contains(concat(" ", normalize-space(@class), " "), " locality ")]//text()'
+                '//span[contains(concat(" ", normalize-space(@class), " "), " locality ")]'
             )
-            locality_values = [" ".join(x.split()) for x in localities if x.strip()]
+            locality_values = [
+                " ".join(node.xpath(".//text()")).split()
+                for node in locality_nodes
+            ]
+            locality_values = [" ".join(x) for x in locality_values if x]
             route_from = locality_values[0] if len(locality_values) > 0 else ""
             route_to = locality_values[1] if len(locality_values) > 1 else ""
+
+            route_from_full = ""
+            route_to_full = ""
+            route_from_region = ""
+            route_to_region = ""
+            if locality_nodes:
+                (
+                    route_from_full,
+                    _route_from_district,
+                    route_from_region,
+                ) = self._extract_geo_context(locality_nodes[0])
+            if len(locality_nodes) > 1:
+                (
+                    route_to_full,
+                    _route_to_district,
+                    route_to_region,
+                ) = self._extract_geo_context(locality_nodes[1])
 
             dist_node = card.xpath(
                 './/a[contains(concat(" ", normalize-space(@class), " "), " distance ")]//text()'
@@ -501,6 +613,7 @@ class DellaMobileScraper:
                 )
             )
             tags = [" ".join(t.split()) for t in tag_nodes if t.strip()]
+            transport_types = self._extract_transport_types(card, tags)
 
             raw_fingerprint = f"{route_from.strip().lower()}_{route_to.strip().lower()}_{dist_km}_{weight_val}_{volume_val}_{price_val}_{cargo_desc.strip().lower()}"
             stable_req_id = hashlib.sha256(raw_fingerprint.encode("utf-8")).hexdigest()
@@ -512,6 +625,10 @@ class DellaMobileScraper:
                     published_relative=time_str,
                     route_from=route_from,
                     route_to=route_to,
+                    route_from_full=route_from_full,
+                    route_to_full=route_to_full,
+                    route_from_region=route_from_region,
+                    route_to_region=route_to_region,
                     distance_km=dist_km,
                     cargo_type=cargo_desc,
                     weight_t=weight_val,
@@ -519,6 +636,7 @@ class DellaMobileScraper:
                     price_uah=price_val,
                     price_per_km_uah=price_km_val,
                     tags=tags,
+                    transport_types=transport_types,
                 )
             )
 
