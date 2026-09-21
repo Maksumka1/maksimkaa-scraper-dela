@@ -322,7 +322,7 @@ def format_archive_row(row: asyncpg.Record) -> str:
 
     if row["order_url"]:
         lines.append(
-            f'🔗 <a href="{html.escape(str(row["order_url"], quote=True))}">Відкрити замовлення на Della</a>'
+            f'🔗 <a href="{html.escape(str(row["order_url"]), quote=True)}">Відкрити замовлення на Della</a>'
         )
     
     lines.append(f"⏱ {html.escape(str(row['published_relative'] or ''))}")
