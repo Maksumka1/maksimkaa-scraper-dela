@@ -502,7 +502,7 @@ class DellaMobileScraper:
             )
             tags = [" ".join(t.split()) for t in tag_nodes if t.strip()]
 
-            raw_fingerprint = f"{route_from}_{route_to}_{dist_km}_{weight_val}_{volume_val}_{price_val}_{cargo_desc}_{dateup_ts}"
+            raw_fingerprint = f"{route_from.strip().lower()}_{route_to.strip().lower()}_{dist_km}_{weight_val}_{volume_val}_{price_val}_{cargo_desc.strip().lower()}"
             stable_req_id = hashlib.sha256(raw_fingerprint.encode("utf-8")).hexdigest()
 
             results.append(
