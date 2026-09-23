@@ -21,7 +21,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const filterSchemaVersion = 2
+const filterSchemaVersion = 3
 
 type UserFilter struct {
 	ChatID int64
@@ -37,11 +37,12 @@ type UserFilter struct {
 	ToCities       []string
 	ToRegions      []string
 
-	MinWeight     float64
-	MaxWeight     float64
-	MinVolume     float64
-	MaxVolume     float64
-	MinPricePerKm float64
+	MinWeight        float64
+	MaxWeight        float64
+	MinVolume        float64
+	MaxVolume        float64
+	MinPricePerKm    float64
+	HotMinPricePerKm float64
 
 	TransportTypes      []string
 	ReturnSearchEnabled bool
@@ -328,7 +329,7 @@ func main() {
 							continue
 						}
 
-						text := formatAlert(cargo)
+						text := formatAlert(cargo, f)
 						var returnCandidates []*CargoPayload
 						if f.ReturnSearchEnabled || f.RoundTripOnly {
 							candidates, err := findReturnCargo(ctx, dbPool, cargo, f, 5)
@@ -471,9 +472,10 @@ func sendHTTPRequest(
 	store *FilterStore,
 ) {
 	body, _ := json.Marshal(map[string]interface{}{
-		"chat_id":    task.ChatID,
-		"text":       task.Text,
-		"parse_mode": "HTML",
+		"chat_id":                  task.ChatID,
+		"text":                     task.Text,
+		"parse_mode":               "HTML",
+		"disable_web_page_preview": true,
 	})
 
 	resp, err := client.Post(url, "application/json", bytes.NewBuffer(body))
@@ -804,27 +806,31 @@ func hasTransportIntersection(cargoTypes, filterTypes []string) bool {
 	return false
 }
 
-func formatAlert(c *CargoPayload) string {
-	text := fmt.Sprintf(
-		"⚡️ <b>Новий вантаж!</b>\n\n"+
-			"📍 <b>%s ➔ %s</b> (%d км)\n"+
-			"Вантаж: %s | %.1f т | %.1f м³\n"+
-			"💰 <b>%.0f грн</b> (<b>%.2f грн/км</b>)\n",
-		escapeTelegramHTML(c.RouteFrom), escapeTelegramHTML(c.RouteTo), c.DistanceKm,
-		escapeTelegramHTML(c.CargoType), c.WeightT, c.VolumeM3,
-		c.PriceUAH, c.PricePerKmUAH,
-	)
+func formatAlert(c *CargoPayload, f *UserFilter) string {
+	var b strings.Builder
+	hot := f != nil && f.HotMinPricePerKm > 0 && c.PricePerKmUAH >= f.HotMinPricePerKm
+	if hot {
+		b.WriteString("🔥 <b>ГАРЯЧА СТАВКА</b>\n")
+	}
+	fmt.Fprintf(&b, "📍 <b>%s ➔ %s</b> · %d км\n", escapeTelegramHTML(c.RouteFrom), escapeTelegramHTML(c.RouteTo), c.DistanceKm)
+	fmt.Fprintf(&b, "📦 %s\n", escapeTelegramHTML(c.CargoType))
+	fmt.Fprintf(&b, "⚖️ %.1f т · %.1f м³\n", c.WeightT, c.VolumeM3)
+	if c.PriceUAH > 0 && c.PricePerKmUAH > 0 {
+		fmt.Fprintf(&b, "💰 <b>%.0f грн</b> · <b>%.2f грн/км</b>\n", c.PriceUAH, c.PricePerKmUAH)
+	} else if c.PriceUAH > 0 {
+		fmt.Fprintf(&b, "💰 <b>%.0f грн</b> · ставка/км не вказана\n", c.PriceUAH)
+	} else {
+		b.WriteString("💰 Ставка не вказана\n")
+	}
 
 	if len(c.TransportTypes) > 0 {
-		text += fmt.Sprintf("🚛 Транспорт: %s\n", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
+		fmt.Fprintf(&b, "🚛 %s\n", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
 	}
-
 	if c.OrderURL != "" {
-		text += fmt.Sprintf("🔗 <a href=\"%s\">Відкрити замовлення на Della</a>\n", escapeTelegramHTML(c.OrderURL))
+		fmt.Fprintf(&b, "🔗 <a href=\"%s\">Відкрити замовлення на Della</a>\n", escapeTelegramHTML(c.OrderURL))
 	}
-
-	text += fmt.Sprintf("⏱ %s", escapeTelegramHTML(c.PublishedRelative))
-	return text
+	fmt.Fprintf(&b, "⏱ %s", escapeTelegramHTML(c.PublishedRelative))
+	return b.String()
 }
 
 func buildUserFilter(chatID int64, data map[string]string) *UserFilter {
@@ -833,6 +839,11 @@ func buildUserFilter(chatID int64, data map[string]string) *UserFilter {
 		if err == nil && version > filterSchemaVersion {
 			log.Printf("Фільтр %d має новішу schema_version=%d; застосовано відомі поля", chatID, version)
 		}
+	}
+
+	hotMinPriceKm := parseFloatField(data, "hot_min_price_km")
+	if strings.TrimSpace(data["hot_min_price_km"]) == "" {
+		hotMinPriceKm = 20
 	}
 
 	filter := &UserFilter{
@@ -850,6 +861,7 @@ func buildUserFilter(chatID int64, data map[string]string) *UserFilter {
 		MinVolume:           parseFloatField(data, "min_volume"),
 		MaxVolume:           parseFloatField(data, "max_volume"),
 		MinPricePerKm:       parseFloatField(data, "min_price_km"),
+		HotMinPricePerKm:    hotMinPriceKm,
 		TransportTypes:      parseStringSlice(data["transport_types"]),
 		ReturnSearchEnabled: parseBoolField(data, "return_search_enabled"),
 		RoundTripOnly:       parseBoolField(data, "round_trip_only"),

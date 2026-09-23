@@ -60,7 +60,7 @@ class FilterWizard(StatesGroup):
 
 def blank_filter() -> Dict[str, Any]:
     return {
-        "schema_version": "2",
+        "schema_version": "3",
         "route_from": "",
         "route_to": "",
         "from_all_ukraine": False,
@@ -75,6 +75,7 @@ def blank_filter() -> Dict[str, Any]:
         "max_volume": None,
         "transport_types": [],
         "min_price_km": None,
+        "hot_min_price_km": 20.0,
         "return_search_enabled": False,
         "round_trip_only": False,
         "enabled": False,
@@ -143,6 +144,8 @@ def filter_from_redis(data: Dict[str, str]) -> Dict[str, Any]:
     result["max_volume"] = safe_float(data.get("max_volume"))
     result["transport_types"] = safe_json_list(data.get("transport_types", "[]"))
     result["min_price_km"] = safe_float(data.get("min_price_km"))
+    hot_value = safe_float(data.get("hot_min_price_km"))
+    result["hot_min_price_km"] = 20.0 if hot_value is None else hot_value
     result["return_search_enabled"] = data.get("return_search_enabled") in {"1", "true", "yes"}
     result["round_trip_only"] = data.get("round_trip_only") in {"1", "true", "yes"}
     result["enabled"] = data.get("enabled") in {"1", "true", "yes"}
@@ -166,7 +169,7 @@ def filter_to_redis(data: Dict[str, Any]) -> Dict[str, str]:
         return "" if value is None else str(float(value))
 
     return {
-        "schema_version": "2",
+        "schema_version": "3",
         "route_from": normalize_text(data.get("route_from", "")),
         "route_to": normalize_text(data.get("route_to", "")),
         "from_all_ukraine": "1" if data.get("from_all_ukraine") else "0",
@@ -181,6 +184,7 @@ def filter_to_redis(data: Dict[str, Any]) -> Dict[str, str]:
         "max_volume": numeric(data.get("max_volume")),
         "transport_types": json.dumps(transport_types, ensure_ascii=False),
         "min_price_km": numeric(data.get("min_price_km")),
+        "hot_min_price_km": "0" if data.get("hot_min_price_km") is None else numeric(data.get("hot_min_price_km")),
         "return_search_enabled": "1" if (data.get("return_search_enabled") or data.get("round_trip_only")) else "0",
         "round_trip_only": "1" if data.get("round_trip_only") else "0",
         "enabled": "1" if data.get("enabled", True) else "0",
@@ -309,21 +313,30 @@ def build_archive_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
     return query, args
 
 
-def format_archive_row(row: asyncpg.Record) -> str:
+def format_archive_row(row: asyncpg.Record, filter_data: Dict[str, Any]) -> str:
     transport = row["transport_types"] or []
+    hot_min = filter_data.get("hot_min_price_km")
+    rate = row["price_per_km_uah"]
+    is_hot = hot_min is not None and float(hot_min) > 0 and rate is not None and float(rate) >= float(hot_min)
+
     lines = [
-        "📦 <b>[Архів 48г]</b>",
-        f"📍 <b>{html.escape(str(row['route_from']))} ➔ {html.escape(str(row['route_to']))}</b> ({row['distance_km'] or 0} км)",
-        f"Вантаж: {html.escape(str(row['cargo_type'] or '—'))} | {row['weight_t'] if row['weight_t'] is not None else '—'} т | {row['volume_m3'] if row['volume_m3'] is not None else '—'} м³",
-        f"💰 <b>{row['price_uah'] if row['price_uah'] is not None else '—'} грн</b> ({row['price_per_km_uah'] if row['price_per_km_uah'] is not None else '—'} грн/км)",
+        ("🔥 <b>Гаряча ставка</b> · " if is_hot else "🕘 ") + "<b>Архів 48г</b>",
+        f"📍 <b>{html.escape(str(row['route_from']))} ➔ {html.escape(str(row['route_to']))}</b> · {row['distance_km'] or 0} км",
+        f"📦 {html.escape(str(row['cargo_type'] or '—'))}",
+        f"⚖️ {row['weight_t'] if row['weight_t'] is not None else '—'} т · {row['volume_m3'] if row['volume_m3'] is not None else '—'} м³",
     ]
+    if row["price_uah"] is not None and float(row["price_uah"]) > 0 and rate is not None and float(rate) > 0:
+        lines.append(f"💰 <b>{row['price_uah']:.0f} грн</b> · <b>{rate:.2f} грн/км</b>")
+    elif row["price_uah"] is not None and float(row["price_uah"]) > 0:
+       lines.append(f"💰 <b>{row['price_uah']:.0f} грн</b> · ставка/км не вказана")
+    else:
+        lines.append("💰 Ставка не вказана")
+
     if transport:
         lines.append(f"🚛 {html.escape(', '.join(str(x) for x in transport))}")
 
     if row["order_url"]:
-        lines.append(
-            f'🔗 <a href="{html.escape(str(row["order_url"]), quote=True)}">Відкрити замовлення на Della</a>'
-        )
+        lines.append(f'🔗 <a href="{html.escape(str(row["order_url"]), quote=True)}">Відкрити замовлення на Della</a>')
     
     lines.append(f"⏱ {html.escape(str(row['published_relative'] or ''))}")
     return "\n".join(lines)
@@ -342,11 +355,11 @@ async def send_archive(message: types.Message, filter_data: Dict[str, Any], *, h
     chunks: List[str] = []
     current = ""
     if header:
-        current = "📋 <b>Знайдені активні оголошення за останні 48 годин</b>\n"
+        current = "📋 <b>Вантажі за останні 48 годин</b>\n"
         current += f"Знайдено: <b>{len(rows)}</b>\n\n"
 
     for row in rows:
-        block = format_archive_row(row)
+        block = format_archive_row(row, filter_data)
         if len(current) + len(block) + 2 > ARCHIVE_MESSAGE_LIMIT and current.strip():
             chunks.append(current.rstrip())
             current = ""
@@ -355,7 +368,7 @@ async def send_archive(message: types.Message, filter_data: Dict[str, Any], *, h
         chunks.append(current.rstrip())
 
     for index, chunk in enumerate(chunks):
-        await message.answer(chunk, parse_mode="HTML")
+        await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
         if index < len(chunks) - 1:
             await asyncio.sleep(ARCHIVE_PAUSE_SEC)
 
@@ -494,6 +507,7 @@ def config_menu(filter_data: Dict[str, Any]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📐 Об'єм", callback_data="val:volume")],
             [InlineKeyboardButton(text="🚛 Тип транспорту", callback_data="transport")],
             [InlineKeyboardButton(text="💵 Мін. ставка / км", callback_data="val:price")],
+            [InlineKeyboardButton(text="🔥 Гаряча ставка", callback_data="val:hot_price")],
             [InlineKeyboardButton(
                 text=("🔄 Зворотний: ON" if filter_data.get("return_search_enabled") else "🔄 Зворотний: OFF"),
                 callback_data="return_toggle_cfg",
@@ -580,6 +594,8 @@ def render_filter(filter_data: Dict[str, Any]) -> str:
         return f"{low}–{high} {unit}"
 
     transports = filter_data.get("transport_types", [])
+    hot_min = filter_data.get("hot_min_price_km")
+    hot_text = f"від {hot_min:.2f} грн/км" if hot_min is not None and hot_min > 0 else "вимкнена"
     return (
         "<b>📋 Поточний фільтр</b>\n\n"
         f"📍 <b>Звідки:</b> {html.escape(loc('from'))}\n"
@@ -587,7 +603,8 @@ def render_filter(filter_data: Dict[str, Any]) -> str:
         f"⚖️ <b>Маса:</b> {html.escape(range_text('min_weight', 'max_weight', 'т'))}\n"
         f"📐 <b>Об'єм:</b> {html.escape(range_text('min_volume', 'max_volume', 'м³'))}\n"
         f"🚛 <b>Транспорт:</b> {html.escape(', '.join(transports) if transports else 'будь-який')}\n"
-        f"💵 <b>Ставка:</b> {filter_data.get('min_price_km') if filter_data.get('min_price_km') is not None else 'будь-яка'} грн/км\n"
+        f"💵 <b>Мін. ставка:</b> {filter_data.get('min_price_km') if filter_data.get('min_price_km') is not None else 'будь-яка'} грн/км\n"
+        f"🔥 <b>Гаряча ставка:</b> {html.escape(hot_text)}\n"
         f"🔄 <b>Зворотний пошук:</b> {'увімкнений' if filter_data.get('return_search_enabled') else 'вимкнений'}\n"
         f"🚛 <b>Тільки туди + назад:</b> {'так' if filter_data.get('round_trip_only') else 'ні'}"
     )
@@ -806,6 +823,13 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
+    if data == "val:hot_price":
+        await state.set_state(FilterWizard.waiting_value)
+        await state.update_data(filter=filter_data, input_kind="hot_price")
+        await callback.message.answer("🔥 Введіть поріг гарячої ставки грн/км. Наприклад <code>20</code>. Для вимкнення — <code>0</code>.", parse_mode="HTML")
+        await callback.answer()
+        return
+
     if data == "transport":
         await callback.message.edit_text("🚛 <b>Виберіть потрібні типи транспорту</b>\nМожна вибрати декілька.", parse_mode="HTML", reply_markup=transport_menu(filter_data))
         await callback.answer()
@@ -878,6 +902,13 @@ async def wizard_text(message: types.Message, state: FSMContext):
             await message.answer("❌ Введіть невід'ємне число, наприклад <code>40</code>.", parse_mode="HTML")
             return
         filter_data["min_price_km"] = None if value in {None, 0} else value
+
+    elif input_kind == "hot_price":
+        value = safe_float(text)
+        if value is None and text:
+            await message.answer("❌ Введіть невід'ємне число, наприклад <code>20</code>.", parse_mode="HTML")
+            return
+        filter_data["hot_min_price_km"] = None if value in {None, 0} else value
     else:
         await state.clear()
         await message.answer("ℹ️ Неочікуваний режим налаштування.", reply_markup=main_menu())
