@@ -820,7 +820,7 @@ class DellaMobileScraper:
 
             self.metrics.current_interval_sec = self.rate_limiter.current_interval
 
-            # Зведений статус за ітерацію
+            # Зведений статус за ітераці
             logger.info(
                 f"[Status] Пауза: {delay:.1f}s (базова: {self.rate_limiter.current_interval:.1f}s) | "
                 f"Нових: {new_count} | "
