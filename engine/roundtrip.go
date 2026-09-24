@@ -51,6 +51,23 @@ func findReturnCargo(ctx context.Context, db *pgxpool.Pool, forward *CargoPayloa
 			args = append(args, filter.MaxVolume)
 			extra = append(extra, fmt.Sprintf("volume_m3 IS NOT NULL AND volume_m3 <= $%d", len(args)))
 		}
+		for _, item := range []struct {
+			min, max float64
+			col      string
+		}{
+			{filter.MinLength, filter.MaxLength, "length_m"},
+			{filter.MinWidth, filter.MaxWidth, "width_m"},
+			{filter.MinHeight, filter.MaxHeight, "height_m"},
+		} {
+			if item.min > 0 {
+				args = append(args, item.min)
+				extra = append(extra, fmt.Sprintf("%s >= $%d", item.col, len(args)))
+			}
+			if item.max > 0 {
+				args = append(args, item.max)
+				extra = append(extra, fmt.Sprintf("%s IS NOT NULL AND %s <= $%d", item.col, item.col, len(args)))
+			}
+		}
 		if filter.MinPricePerKm > 0 {
 			args = append(args, filter.MinPricePerKm)
 			extra = append(extra, fmt.Sprintf("price_per_km_uah >= $%d", len(args)))
@@ -86,8 +103,12 @@ func findReturnCargo(ctx context.Context, db *pgxpool.Pool, forward *CargoPayloa
                COALESCE(volume_m3, 0),
                COALESCE(price_uah, 0),
                COALESCE(price_per_km_uah, 0),
+               COALESCE(length_m, 0),
+               COALESCE(width_m, 0),
+               COALESCE(height_m, 0),
                COALESCE(transport_types, '{}'),
-               COALESCE(published_relative, '')
+               COALESCE(published_relative, ''),
+               COALESCE(published_at, '')
         FROM cargo_history
         WHERE %s
         ORDER BY created_at DESC
@@ -117,8 +138,12 @@ func findReturnCargo(ctx context.Context, db *pgxpool.Pool, forward *CargoPayloa
 			&c.VolumeM3,
 			&c.PriceUAH,
 			&c.PricePerKmUAH,
+			&c.LengthM,
+			&c.WidthM,
+			&c.HeightM,
 			&c.TransportTypes,
 			&c.PublishedRelative,
+			&c.PublishedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -165,27 +190,44 @@ func formatReturnCandidates(candidates []*CargoPayload) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "\n\n🔄 <b>Можливі зворотні вантажі (48г): %d</b>\n", len(candidates))
 	for i, c := range candidates {
-		fmt.Fprintf(
-			&b,
-			"\n<b>%d.</b> %s ➔ %s (%d км)\n%s | %.1f т | %.1f м³\n💰 %.0f грн (%.2f грн/км)",
-			i+1,
-			escapeTelegramHTML(c.RouteFrom),
-			escapeTelegramHTML(c.RouteTo),
-			c.DistanceKm,
-			escapeTelegramHTML(c.CargoType),
-			c.WeightT,
-			c.VolumeM3,
-			c.PriceUAH,
-			c.PricePerKmUAH,
-		)
-		if len(c.TransportTypes) > 0 {
-			fmt.Fprintf(&b, "\n🚛 %s", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
+		fmt.Fprintf(&b, "\n<b>%d.</b> %s ➔ %s (%d км)\n%s | %.1f т | %.1f м³\n", i+1, escapeTelegramHTML(c.RouteFrom), escapeTelegramHTML(c.RouteTo), c.DistanceKm, escapeTelegramHTML(c.CargoType), c.WeightT, c.VolumeM3)
+		dimensions := []string{}
+		if c.LengthM > 0 {
+			dimensions = append(dimensions, fmt.Sprintf("дов %.2f м", c.LengthM))
 		}
+		if c.WidthM > 0 {
+			dimensions = append(dimensions, fmt.Sprintf("шир %.2f м", c.WidthM))
+		}
+		if c.HeightM > 0 {
+			dimensions = append(dimensions, fmt.Sprintf("вис %.2f м", c.HeightM))
+		}
+		if len(dimensions) == 0 {
+			b.WriteString("📐 Габарити не вказані\n")
+		} else {
+			fmt.Fprintf(&b, "📐 %s\n", escapeTelegramHTML(strings.Join(dimensions, " · ")))
+		}
+
+		if len(c.TransportTypes) > 0 {
+			fmt.Fprintf(&b, "🚛 %s\n", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
+		}
+		b.WriteString("\n")
+		fmt.Fprintf(&b, "💰 %.0f грн (%.2f грн/км)", c.PriceUAH, c.PricePerKmUAH)
+
 		if c.OrderURL != "" {
 			fmt.Fprintf(&b, "\n🔗 <a href=\"%s\">Відкрити замовлення</a>", escapeTelegramHTML(c.OrderURL))
 		}
-		if c.PublishedRelative != "" {
-			fmt.Fprintf(&b, "\n⏱ %s", escapeTelegramHTML(c.PublishedRelative))
+
+		if c.PublishedRelative != "" || c.PublishedAt != "" {
+			b.WriteString("\n⏱ ")
+			if c.PublishedRelative != "" {
+				b.WriteString(escapeTelegramHTML(c.PublishedRelative))
+			}
+			if c.PublishedRelative != "" && c.PublishedAt != "" {
+				b.WriteString(" · ")
+			}
+			if c.PublishedAt != "" {
+				b.WriteString(escapeTelegramHTML(c.PublishedAt))
+			}
 		}
 		b.WriteByte('\n')
 	}
@@ -257,22 +299,88 @@ func formatRoundTripAlert(forward *CargoPayload, returns []*CargoPayload) string
 	b.WriteString("🚛 <b>Знайдено комплект туди + назад</b>\n\n")
 	fmt.Fprintf(&b, "➡️ <b>Туди:</b> %s ➔ %s (%d км)\n", escapeTelegramHTML(forward.RouteFrom), escapeTelegramHTML(forward.RouteTo), forward.DistanceKm)
 	fmt.Fprintf(&b, "Вантаж: %s | %.1f т | %.1f м³\n", escapeTelegramHTML(forward.CargoType), forward.WeightT, forward.VolumeM3)
+
+	dimensions := []string{}
+	if forward.LengthM > 0 {
+		dimensions = append(dimensions, fmt.Sprintf("дов %.2f м", forward.LengthM))
+	}
+	if forward.WidthM > 0 {
+		dimensions = append(dimensions, fmt.Sprintf("шир %.2f м", forward.WidthM))
+	}
+	if forward.HeightM > 0 {
+		dimensions = append(dimensions, fmt.Sprintf("вис %.2f м", forward.HeightM))
+	}
+	if len(dimensions) == 0 {
+		b.WriteString("📐 Габарити не вказані\n")
+	} else {
+		fmt.Fprintf(&b, "📐 %s\n", escapeTelegramHTML(strings.Join(dimensions, " · ")))
+	}
+	if len(forward.TransportTypes) > 0 {
+		fmt.Fprintf(&b, "🚛 %s\n", escapeTelegramHTML(strings.Join(forward.TransportTypes, ", ")))
+	}
+	b.WriteString("\n")
+
 	fmt.Fprintf(&b, "💰 %.0f грн (%.2f грн/км)\n", forward.PriceUAH, forward.PricePerKmUAH)
 	if forward.OrderURL != "" {
 		fmt.Fprintf(&b, "🔗 <a href=\"%s\">Відкрити замовлення</a>\n", escapeTelegramHTML(forward.OrderURL))
+	}
+
+	if forward.PublishedRelative != "" || forward.PublishedAt != "" {
+		b.WriteString("⏱ ")
+		if forward.PublishedRelative != "" {
+			b.WriteString(escapeTelegramHTML(forward.PublishedRelative))
+		}
+		if forward.PublishedRelative != "" && forward.PublishedAt != "" {
+			b.WriteString(" · ")
+		}
+		if forward.PublishedAt != "" {
+			b.WriteString(escapeTelegramHTML(forward.PublishedAt))
+		}
+		b.WriteByte('\n')
 	}
 
 	b.WriteString("\n🔄 <b>Назад:</b>\n")
 	for i, candidate := range returns {
 		fmt.Fprintf(&b, "\n<b>%d.</b> %s ➔ %s (%d км)\n", i+1, escapeTelegramHTML(candidate.RouteFrom), escapeTelegramHTML(candidate.RouteTo), candidate.DistanceKm)
 		fmt.Fprintf(&b, "%s | %.1f т | %.1f м³\n", escapeTelegramHTML(candidate.CargoType), candidate.WeightT, candidate.VolumeM3)
+
+		dimensions := []string{}
+		if candidate.LengthM > 0 {
+			dimensions = append(dimensions, fmt.Sprintf("дов %.2f м", candidate.LengthM))
+		}
+		if candidate.WidthM > 0 {
+			dimensions = append(dimensions, fmt.Sprintf("шир %.2f м", candidate.WidthM))
+		}
+		if candidate.HeightM > 0 {
+			dimensions = append(dimensions, fmt.Sprintf("вис %.2f м", candidate.HeightM))
+		}
+		if len(dimensions) == 0 {
+			b.WriteString("📐 Габарити не вказані\n")
+		} else {
+			fmt.Fprintf(&b, "📐 %s\n", escapeTelegramHTML(strings.Join(dimensions, " · ")))
+		}
+		if len(candidate.TransportTypes) > 0 {
+			fmt.Fprintf(&b, "🚛 %s\n", escapeTelegramHTML(strings.Join(candidate.TransportTypes, ", ")))
+		}
+		b.WriteString("\n")
+
 		fmt.Fprintf(&b, "💰 %.0f грн (%.2f грн/км)", candidate.PriceUAH, candidate.PricePerKmUAH)
 		if candidate.OrderURL != "" {
 			fmt.Fprintf(&b, "\n🔗 <a href=\"%s\">Відкрити замовлення</a>", escapeTelegramHTML(candidate.OrderURL))
 		}
-		if len(candidate.TransportTypes) > 0 {
-			fmt.Fprintf(&b, "\n🚛 %s", escapeTelegramHTML(strings.Join(candidate.TransportTypes, ", ")))
+		if candidate.PublishedRelative != "" || candidate.PublishedAt != "" {
+			b.WriteString("\n⏱ ")
+			if candidate.PublishedRelative != "" {
+				b.WriteString(escapeTelegramHTML(candidate.PublishedRelative))
+			}
+			if candidate.PublishedRelative != "" && candidate.PublishedAt != "" {
+				b.WriteString(" · ")
+			}
+			if candidate.PublishedAt != "" {
+				b.WriteString(escapeTelegramHTML(candidate.PublishedAt))
+			}
 		}
+		b.WriteByte('\n')
 	}
 	return b.String()
 }

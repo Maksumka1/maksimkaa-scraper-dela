@@ -16,12 +16,21 @@ CREATE TABLE IF NOT EXISTS cargo_history (
     distance_km INT,
     weight_t NUMERIC(6, 2),
     volume_m3 NUMERIC(6, 2),
+    length_m NUMERIC(6, 2),
+    width_m NUMERIC(6, 2),
+    height_m NUMERIC(6, 2),
     price_uah NUMERIC(10, 2),
     price_per_km_uah NUMERIC(8, 2),
     published_relative VARCHAR(64),
+    published_at VARCHAR(32),
     order_url TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
++ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS length_m NUMERIC(6, 2);
++ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS width_m NUMERIC(6, 2);
++ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS height_m NUMERIC(6, 2);
++ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS published_at VARCHAR(32);
 
 -- Довідник населених пунктів та областей
 CREATE TABLE IF NOT EXISTS geo_locations (
@@ -58,4 +67,3 @@ CREATE TABLE IF NOT EXISTS round_trip_pairs (
 
 CREATE INDEX IF NOT EXISTS idx_round_trip_pairs_created_at ON round_trip_pairs (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_round_trip_pairs_forward ON round_trip_pairs (forward_request_id, created_at DESC);
-

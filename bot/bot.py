@@ -13,7 +13,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 logging.basicConfig(level=logging.INFO)
 
@@ -73,6 +73,12 @@ def blank_filter() -> Dict[str, Any]:
         "max_weight": None,
         "min_volume": None,
         "max_volume": None,
+        "min_length": None,
+        "max_length": None,
+        "min_width": None,
+        "max_width": None,
+        "min_height": None,
+        "max_height": None,
         "transport_types": [],
         "min_price_km": None,
         "hot_min_price_km": 20.0,
@@ -142,6 +148,12 @@ def filter_from_redis(data: Dict[str, str]) -> Dict[str, Any]:
     result["max_weight"] = safe_float(data.get("max_weight"))
     result["min_volume"] = safe_float(data.get("min_volume"))
     result["max_volume"] = safe_float(data.get("max_volume"))
+    result["min_length"] = safe_float(data.get("min_length"))
+    result["max_length"] = safe_float(data.get("max_length"))
+    result["min_width"] = safe_float(data.get("min_width"))
+    result["max_width"] = safe_float(data.get("max_width"))
+    result["min_height"] = safe_float(data.get("min_height"))
+    result["max_height"] = safe_float(data.get("max_height"))
     result["transport_types"] = safe_json_list(data.get("transport_types", "[]"))
     result["min_price_km"] = safe_float(data.get("min_price_km"))
     hot_value = safe_float(data.get("hot_min_price_km"))
@@ -182,6 +194,12 @@ def filter_to_redis(data: Dict[str, Any]) -> Dict[str, str]:
         "max_weight": numeric(data.get("max_weight")),
         "min_volume": numeric(data.get("min_volume")),
         "max_volume": numeric(data.get("max_volume")),
+        "min_length": numeric(data.get("min_length")),
+        "max_length": numeric(data.get("max_length")),
+        "min_width": numeric(data.get("min_width")),
+        "max_width": numeric(data.get("max_width")),
+        "min_height": numeric(data.get("min_height")),
+        "max_height": numeric(data.get("max_height")),
         "transport_types": json.dumps(transport_types, ensure_ascii=False),
         "min_price_km": numeric(data.get("min_price_km")),
         "hot_min_price_km": "0" if data.get("hot_min_price_km") is None else numeric(data.get("hot_min_price_km")),
@@ -292,6 +310,23 @@ def build_archive_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
     if max_volume is not None:
         args.append(max_volume)
         clauses.append(f"volume_m3 IS NOT NULL AND volume_m3 <= ${len(args)}")
+
+    for min_key, max_key, col in ((
+        "min_length", "max_length", "length_m",
+    ), (
+        "min_width", "max_width", "width_m",
+    ), (
+        "min_height", "max_height", "height_m",
+    )):
+        low = filter_data.get(min_key)
+        high = filter_data.get(max_key)
+        if low is not None:
+            args.append(low)
+            clauses.append(f"{col} >= ${len(args)}")
+        if high is not None:
+            args.append(high)
+            clauses.append(f"{col} IS NOT NULL AND {col} <= ${len(args)}")
+
     if min_price is not None:
         args.append(min_price)
         clauses.append(f"price_per_km_uah >= ${len(args)}")
@@ -304,8 +339,8 @@ def build_archive_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
     query = f"""
         SELECT route_from, route_to, order_url,route_from_full, route_to_full,
                route_from_region, route_to_region, distance_km, cargo_type,
-               weight_t, volume_m3, price_uah, price_per_km_uah,
-               transport_types, published_relative, created_at
+               weight_t, volume_m3, length_m, width_m, height_m,
+               price_uah, price_per_km_uah, transport_types, published_relative, published_at, created_at
         FROM cargo_history
         WHERE {' AND '.join(clauses)}
         ORDER BY created_at DESC
@@ -319,26 +354,44 @@ def format_archive_row(row: asyncpg.Record, filter_data: Dict[str, Any]) -> str:
     rate = row["price_per_km_uah"]
     is_hot = hot_min is not None and float(hot_min) > 0 and rate is not None and float(rate) >= float(hot_min)
 
+    dimensions = []
+    for key, label in (("length_m", "дов"), ("width_m", "шир"), ("height_m", "вис")):
+        value = row[key]
+        if value is not None and float(value) > 0:
+            dimensions.append(f"{label} {float(value):.2f} м")
+    dimension_text = " · ".join(dimensions) if dimensions else "Габарити не вказані"
+
     lines = [
         ("🔥 <b>Гаряча ставка</b> · " if is_hot else "🕘 ") + "<b>Архів 48г</b>",
         f"📍 <b>{html.escape(str(row['route_from']))} ➔ {html.escape(str(row['route_to']))}</b> · {row['distance_km'] or 0} км",
         f"📦 {html.escape(str(row['cargo_type'] or '—'))}",
         f"⚖️ {row['weight_t'] if row['weight_t'] is not None else '—'} т · {row['volume_m3'] if row['volume_m3'] is not None else '—'} м³",
     ]
+
+    lines.append(f"📐 {html.escape(dimension_text)}")
+    if transport:
+        lines.append(f"🚛 {html.escape(', '.join(str(x) for x in transport))}")
+    lines.append("")
+
     if row["price_uah"] is not None and float(row["price_uah"]) > 0 and rate is not None and float(rate) > 0:
         lines.append(f"💰 <b>{row['price_uah']:.0f} грн</b> · <b>{rate:.2f} грн/км</b>")
     elif row["price_uah"] is not None and float(row["price_uah"]) > 0:
-       lines.append(f"💰 <b>{row['price_uah']:.0f} грн</b> · ставка/км не вказана")
+        lines.append(f"💰 <b>{row['price_uah']:.0f} грн</b> · ставка/км не вказана")
     else:
         lines.append("💰 Ставка не вказана")
 
-    if transport:
-        lines.append(f"🚛 {html.escape(', '.join(str(x) for x in transport))}")
-
     if row["order_url"]:
         lines.append(f'🔗 <a href="{html.escape(str(row["order_url"]), quote=True)}">Відкрити замовлення на Della</a>')
+
+    relative = str(row["published_relative"] or "")
+    exact = str(row["published_at"] or "")
+    if relative and exact:
+        lines.append(f"⏱ {html.escape(relative)} · {html.escape(exact)}")
+    elif relative:
+        lines.append(f"⏱ {html.escape(relative)}")
+    elif exact:
+        lines.append(f"⏱ {html.escape(exact)}")
     
-    lines.append(f"⏱ {html.escape(str(row['published_relative'] or ''))}")
     return "\n".join(lines)
 
 
@@ -349,7 +402,7 @@ async def send_archive(message: types.Message, filter_data: Dict[str, Any], *, h
         rows = await conn.fetch(query, *args)
 
     if not rows:
-        await message.answer("ℹ️ За останні 48 годин відповідних вантажів не знайдено.", reply_markup=main_menu())
+        await message.answer("ℹ️ За останні 48 годин відповідних вантажів не знайдено.", reply_markup=bottom_menu())
         return 0
 
     chunks: List[str] = []
@@ -405,12 +458,12 @@ def build_forecast_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
         legacy=filter_data.get("route_from", ""),
     )
 
-    for key, col in (("min_weight", "weight_t"), ("min_volume", "volume_m3"), ("min_price_km", "price_per_km_uah")):
+    for key, col in (("min_weight", "weight_t"), ("min_volume", "volume_m3"), ("min_length", "length_m"), ("min_width", "width_m"), ("min_height", "height_m"), ("min_price_km", "price_per_km_uah")):
         value = filter_data.get(key)
         if value is not None:
             args.append(value)
             clauses.append(f"{col} >= ${len(args)}")
-    for key, col in (("max_weight", "weight_t"), ("max_volume", "volume_m3")):
+    for key, col in (("max_weight", "weight_t"), ("max_volume", "volume_m3"), ("max_length", "length_m"), ("max_width", "width_m"), ("max_height", "height_m")):
         value = filter_data.get(key)
         if value is not None:
             args.append(value)
@@ -445,7 +498,7 @@ async def send_forecast(message: types.Message, filter_data: Dict[str, Any]) -> 
             "📈 <b>Прогноз повернення</b>\n\n"
             "Недостатньо історичних даних для прогнозу за вибраним напрямком.",
             parse_mode="HTML",
-            reply_markup=main_menu(),
+            reply_markup=bottom_menu(),
         )
         return 0
 
@@ -481,8 +534,22 @@ async def send_forecast(message: types.Message, filter_data: Dict[str, Any]) -> 
             "",
         ])
 
-    await message.answer("\n".join(lines).rstrip(), parse_mode="HTML", reply_markup=main_menu())
+    await message.answer("\n".join(lines).rstrip(), parse_mode="HTML", reply_markup=bottom_menu())
     return len(forecasts)
+
+def bottom_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⚙️ Налаштувати фільтр"), KeyboardButton(text="📋 Мій фільтр")],
+            [KeyboardButton(text="📦 Наявні вантажі (48г)"), KeyboardButton(text="🔄 Зворотний пошук")],
+            [KeyboardButton(text="🚛 Туди + назад"), KeyboardButton(text="📈 Прогноз повернення")],
+            [KeyboardButton(text="🗑 Очистити фільтр")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -505,6 +572,9 @@ def config_menu(filter_data: Dict[str, Any]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🎯 Куди", callback_data="loc:to")],
             [InlineKeyboardButton(text="⚖️ Маса", callback_data="val:weight")],
             [InlineKeyboardButton(text="📐 Об'єм", callback_data="val:volume")],
+            [InlineKeyboardButton(text="📏 Довжина", callback_data="val:length")],
+            [InlineKeyboardButton(text="↔️ Ширина", callback_data="val:width")],
+            [InlineKeyboardButton(text="↕️ Висота", callback_data="val:height")],
             [InlineKeyboardButton(text="🚛 Тип транспорту", callback_data="transport")],
             [InlineKeyboardButton(text="💵 Мін. ставка / км", callback_data="val:price")],
             [InlineKeyboardButton(text="🔥 Гаряча ставка", callback_data="val:hot_price")],
@@ -602,6 +672,7 @@ def render_filter(filter_data: Dict[str, Any]) -> str:
         f"🎯 <b>Куди:</b> {html.escape(loc('to'))}\n"
         f"⚖️ <b>Маса:</b> {html.escape(range_text('min_weight', 'max_weight', 'т'))}\n"
         f"📐 <b>Об'єм:</b> {html.escape(range_text('min_volume', 'max_volume', 'м³'))}\n"
+        f"📏 <b>Габарити:</b> дов {html.escape(range_text('min_length', 'max_length', 'м'))}; шир {html.escape(range_text('min_width', 'max_width', 'м'))}; вис {html.escape(range_text('min_height', 'max_height', 'м'))}\n"
         f"🚛 <b>Транспорт:</b> {html.escape(', '.join(transports) if transports else 'будь-який')}\n"
         f"💵 <b>Мін. ставка:</b> {filter_data.get('min_price_km') if filter_data.get('min_price_km') is not None else 'будь-яка'} грн/км\n"
         f"🔥 <b>Гаряча ставка:</b> {html.escape(hot_text)}\n"
@@ -617,7 +688,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "Налаштовуйте фільтр кнопками: області, кілька міст, діапазони маси/об'єму, транспорт, зворотний пошук та режим «туди + назад».\n\n"
         "Старий формат <code>/set Черкаси; Брюховичі; 5.0; 40.0</code> теж підтримується.",
         parse_mode="HTML",
-        reply_markup=main_menu(),
+        reply_markup=bottom_menu(),
     )
 
 
@@ -648,7 +719,7 @@ async def cmd_set_filter(message: types.Message, state: FSMContext):
     chat_id = message.chat.id
 
     await persist_filter(chat_id, filter_data)
-    await message.answer("✅ Старий фільтр збережено. Показую всі відповідні оголошення за 48 годин...", reply_markup=main_menu())
+    await message.answer("✅ Старий фільтр збережено. Показую всі відповідні оголошення за 48 годин...", reply_markup=bottom_menu())
     await send_archive(message, filter_data)
 
 
@@ -662,13 +733,13 @@ async def cmd_clear(message: types.Message, state: FSMContext):
         pipe.srem("filters:active_users", chat_id)
         pipe.publish("channel:filters:update", chat_id)
         await pipe.execute()
-    await message.answer("🗑 Фільтр видалено. Сповіщення зупинено.", reply_markup=main_menu())
+    await message.answer("🗑 Фільтр видалено. Сповіщення зупинено.", reply_markup=bottom_menu())
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("↩️ Редагування скасовано.", reply_markup=main_menu())
+    await message.answer("↩️ Редагування скасовано.", reply_markup=bottom_menu())
 
 
 @dp.callback_query()
@@ -816,6 +887,14 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("📐 Введіть <code>мін;макс</code> у м³.\nНаприклад: <code>20;80</code>.", parse_mode="HTML")
         await callback.answer()
         return
+    if data in {"val:length", "val:width", "val:height"}:
+        labels = {"val:length": ("довжину", "м"), "val:width": ("ширину", "м"), "val:height": ("висоту", "м")}
+        label, unit = labels[data]
+        await state.set_state(FilterWizard.waiting_value)
+        await state.update_data(filter=filter_data, input_kind=data.split(":", 1)[1])
+        await callback.message.answer(f"📏 Введіть <code>мін;макс</code> у {unit} для {label}.\nНаприклад: <code>2;4</code>.", parse_mode="HTML")
+        await callback.answer()
+        return
     if data == "val:price":
         await state.set_state(FilterWizard.waiting_value)
         await state.update_data(filter=filter_data, input_kind="price")
@@ -854,6 +933,81 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
 
     await callback.answer("Невідома команда")
 
+@dp.message(F.text.in_({
+    "⚙️ Налаштувати фільтр",
+    "📋 Мій фільтр",
+    "📦 Наявні вантажі (48г)",
+    "🔄 Зворотний пошук",
+    "🚛 Туди + назад",
+    "📈 Прогноз повернення",
+    "🗑 Очистити фільтр",
+}))
+async def bottom_menu_handler(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    chat_id = message.chat.id
+
+    if text == "⚙️ Налаштувати фільтр":
+        filter_data = await get_saved_filter(chat_id)
+        await state.clear()
+        await state.update_data(filter=filter_data)
+        await message.answer(render_filter(filter_data), parse_mode="HTML", reply_markup=config_menu(filter_data))
+        return
+
+    if text == "📋 Мій фільтр":
+        await message.answer(render_filter(await get_saved_filter(chat_id)), parse_mode="HTML", reply_markup=bottom_menu())
+        return
+
+    if text == "📦 Наявні вантажі (48г)":
+        filter_data = await get_saved_filter(chat_id)
+        if not filter_data.get("enabled"):
+            await message.answer("Спочатку налаштуйте та збережіть фільтр", reply_markup=bottom_menu())
+            return
+        await send_archive(message, filter_data)
+        return
+
+    if text == "🔄 Зворотний пошук":
+        filter_data = await get_saved_filter(chat_id)
+        if not filter_data.get("enabled"):
+            await message.answer("Спочатку налаштуйте та збережіть фільтр", reply_markup=bottom_menu())
+            return
+        filter_data["return_search_enabled"] = not bool(filter_data.get("return_search_enabled"))
+        await persist_filter(chat_id, filter_data)
+        await message.answer(render_filter(filter_data), parse_mode="HTML", reply_markup=bottom_menu())
+        return
+
+    if text == "🚛 Туди + назад":
+        filter_data = await get_saved_filter(chat_id)
+        if not filter_data.get("enabled"):
+            await message.answer("Спочатку налаштуйте та збережіть фільтр", reply_markup=bottom_menu())
+            return
+        new_value = not bool(filter_data.get("round_trip_only"))
+        filter_data["round_trip_only"] = new_value
+        if new_value:
+            filter_data["return_search_enabled"] = True
+        await persist_filter(chat_id, filter_data)
+        await message.answer(render_filter(filter_data), parse_mode="HTML", reply_markup=bottom_menu())
+        return
+
+    if text == "📈 Прогноз повернення":
+        filter_data = await get_saved_filter(chat_id)
+        if not filter_data.get("enabled"):
+            await message.answer("Спочатку налаштуйте та збережіть фільтр", reply_markup=bottom_menu())
+            return
+        await send_forecast(message, filter_data)
+        return
+
+    if text == "🗑 Очистити фільтр":
+        assert redis_client is not None
+        async with redis_client.pipeline(transaction=True) as pipe:
+            pipe.delete(f"filter:{chat_id}")
+            pipe.srem("filters:active_users", str(chat_id))
+            pipe.publish("channel:filters:update", str(chat_id))
+            await pipe.execute()
+        await state.clear()
+        await message.answer("🗑 Фільтр очищено.", reply_markup=bottom_menu())
+
+
+
 
 @dp.message(FilterWizard.waiting_value, F.text)
 async def wizard_text(message: types.Message, state: FSMContext):
@@ -880,7 +1034,7 @@ async def wizard_text(message: types.Message, state: FSMContext):
         current = filter_data.get(f"{side}_regions", [])
         filter_data[f"{side}_regions"] = list(dict.fromkeys(current + values))
         filter_data[f"{side}_all_ukraine"] = False
-    elif input_kind in {"weight", "volume"}:
+    elif input_kind in {"weight", "volume", "length", "width", "height"}:
         parts = [x.strip() for x in text.split(";", 1)]
         if len(parts) != 2:
             await message.answer("❌ Формат: <code>мін;макс</code>. Наприклад <code>5;20</code>.", parse_mode="HTML")
@@ -893,7 +1047,14 @@ async def wizard_text(message: types.Message, state: FSMContext):
         if low is not None and high is not None and low > high:
             await message.answer("❌ Мінімум не може бути більшим за максимум.")
             return
-        min_key, max_key = (("min_weight", "max_weight") if input_kind == "weight" else ("min_volume", "max_volume"))
+        range_keys = {
+            "weight": ("min_weight", "max_weight"),
+            "volume": ("min_volume", "max_volume"),
+            "length": ("min_length", "max_length"),
+            "width": ("min_width", "max_width"),
+            "height": ("min_height", "max_height"),
+        }
+        min_key, max_key = range_keys[input_kind]
         filter_data[min_key] = low
         filter_data[max_key] = high
     elif input_kind == "price":
@@ -964,3 +1125,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    

@@ -41,6 +41,12 @@ type UserFilter struct {
 	MaxWeight        float64
 	MinVolume        float64
 	MaxVolume        float64
+	MinLength        float64
+	MaxLength        float64
+	MinWidth         float64
+	MaxWidth         float64
+	MinHeight        float64
+	MaxHeight        float64
 	MinPricePerKm    float64
 	HotMinPricePerKm float64
 
@@ -103,6 +109,10 @@ type CargoPayload struct {
 	PriceUAH          float64
 	PricePerKmUAH     float64
 	PublishedRelative string
+	PublishedAt       string
+	LengthM           float64
+	WidthM            float64
+	HeightM           float64
 }
 
 type TelegramTask struct {
@@ -180,6 +190,9 @@ func parsePayload(vals map[string]interface{}) (*CargoPayload, error) {
 	vol, _ := strconv.ParseFloat(getString("volume_m3"), 64)
 	price, _ := strconv.ParseFloat(getString("price_uah"), 64)
 	priceKm, _ := strconv.ParseFloat(getString("price_per_km_uah"), 64)
+	length, _ := strconv.ParseFloat(getString("length_m"), 64)
+	width, _ := strconv.ParseFloat(getString("width_m"), 64)
+	height, _ := strconv.ParseFloat(getString("height_m"), 64)
 
 	return &CargoPayload{
 		RequestID:         getString("request_id"),
@@ -199,6 +212,10 @@ func parsePayload(vals map[string]interface{}) (*CargoPayload, error) {
 		PriceUAH:          price,
 		PricePerKmUAH:     priceKm,
 		PublishedRelative: getString("published_relative"),
+		PublishedAt:       getString("published_at"),
+		LengthM:           length,
+		WidthM:            width,
+		HeightM:           height,
 	}, nil
 }
 
@@ -599,8 +616,9 @@ func saveBatchToPostgres(ctx context.Context, db *pgxpool.Pool, items []*CargoPa
 		INSERT INTO cargo_history (
 			request_id, route_from, route_to, order_url, route_from_full, route_to_full,
 			route_from_region, route_to_region, cargo_type, tags, transport_types,
-			distance_km, weight_t, volume_m3, price_uah, price_per_km_uah, published_relative
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			distance_km, weight_t, volume_m3, length_m, width_m, height_m,
+			price_uah, price_per_km_uah, published_relative, published_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		ON CONFLICT (request_id) DO UPDATE SET
 			order_url = EXCLUDED.order_url,
 			route_from_full = EXCLUDED.route_from_full,
@@ -608,7 +626,12 @@ func saveBatchToPostgres(ctx context.Context, db *pgxpool.Pool, items []*CargoPa
 			route_from_region = EXCLUDED.route_from_region,
 			route_to_region = EXCLUDED.route_to_region,
 			tags = EXCLUDED.tags,
-			transport_types = EXCLUDED.transport_types;
+			transport_types = EXCLUDED.transport_types,
+			length_m = EXCLUDED.length_m,
+		    width_m = EXCLUDED.width_m,
+		    height_m = EXCLUDED.height_m,
+			published_relative = EXCLUDED.published_relative,
+			published_at = EXCLUDED.published_at;
 	`
 
 	for _, c := range items {
@@ -627,9 +650,13 @@ func saveBatchToPostgres(ctx context.Context, db *pgxpool.Pool, items []*CargoPa
 			c.DistanceKm,
 			c.WeightT,
 			c.VolumeM3,
+			c.LengthM,
+			c.WidthM,
+			c.HeightM,
 			c.PriceUAH,
 			c.PricePerKmUAH,
 			c.PublishedRelative,
+			c.PublishedAt,
 		)
 	}
 
@@ -737,6 +764,20 @@ func match(c *CargoPayload, f *UserFilter) bool {
 			return false
 		}
 	}
+	for _, item := range []struct {
+		min, max, value float64
+	}{
+		{f.MinLength, f.MaxLength, c.LengthM},
+		{f.MinWidth, f.MaxWidth, c.WidthM},
+		{f.MinHeight, f.MaxHeight, c.HeightM},
+	} {
+		if item.min > 0 && item.value < item.min {
+			return false
+		}
+		if item.max > 0 && (item.value <= 0 || item.value > item.max) {
+			return false
+		}
+	}
 	if f.MinPricePerKm > 0 && c.PricePerKmUAH < f.MinPricePerKm {
 		return false
 	}
@@ -815,6 +856,27 @@ func formatAlert(c *CargoPayload, f *UserFilter) string {
 	fmt.Fprintf(&b, "📍 <b>%s ➔ %s</b> · %d км\n", escapeTelegramHTML(c.RouteFrom), escapeTelegramHTML(c.RouteTo), c.DistanceKm)
 	fmt.Fprintf(&b, "📦 %s\n", escapeTelegramHTML(c.CargoType))
 	fmt.Fprintf(&b, "⚖️ %.1f т · %.1f м³\n", c.WeightT, c.VolumeM3)
+
+	dimensions := []string{}
+	if c.LengthM > 0 {
+		dimensions = append(dimensions, fmt.Sprintf("дов %.2f м", c.LengthM))
+	}
+	if c.WidthM > 0 {
+		dimensions = append(dimensions, fmt.Sprintf("шир %.2f м", c.WidthM))
+	}
+	if c.HeightM > 0 {
+		dimensions = append(dimensions, fmt.Sprintf("вис %.2f м", c.HeightM))
+	}
+	if len(dimensions) == 0 {
+		b.WriteString("📐 Габарити не вказані\n")
+	} else {
+		fmt.Fprintf(&b, "📐 %s\n", escapeTelegramHTML(strings.Join(dimensions, " · ")))
+	}
+	if len(c.TransportTypes) > 0 {
+		fmt.Fprintf(&b, "🚛 %s\n", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
+	}
+	b.WriteString("\n")
+
 	if c.PriceUAH > 0 && c.PricePerKmUAH > 0 {
 		fmt.Fprintf(&b, "💰 <b>%.0f грн</b> · <b>%.2f грн/км</b>\n", c.PriceUAH, c.PricePerKmUAH)
 	} else if c.PriceUAH > 0 {
@@ -823,13 +885,14 @@ func formatAlert(c *CargoPayload, f *UserFilter) string {
 		b.WriteString("💰 Ставка не вказана\n")
 	}
 
-	if len(c.TransportTypes) > 0 {
-		fmt.Fprintf(&b, "🚛 %s\n", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
+	if c.PublishedRelative != "" && c.PublishedAt != "" {
+		fmt.Fprintf(&b, "⏱ %s · %s", escapeTelegramHTML(c.PublishedRelative), escapeTelegramHTML(c.PublishedAt))
+	} else if c.PublishedRelative != "" {
+		fmt.Fprintf(&b, "⏱ %s", escapeTelegramHTML(c.PublishedRelative))
+	} else if c.PublishedAt != "" {
+		fmt.Fprintf(&b, "⏱ %s", escapeTelegramHTML(c.PublishedAt))
 	}
-	if c.OrderURL != "" {
-		fmt.Fprintf(&b, "🔗 <a href=\"%s\">Відкрити замовлення на Della</a>\n", escapeTelegramHTML(c.OrderURL))
-	}
-	fmt.Fprintf(&b, "⏱ %s", escapeTelegramHTML(c.PublishedRelative))
+
 	return b.String()
 }
 
@@ -860,6 +923,12 @@ func buildUserFilter(chatID int64, data map[string]string) *UserFilter {
 		MaxWeight:           parseFloatField(data, "max_weight"),
 		MinVolume:           parseFloatField(data, "min_volume"),
 		MaxVolume:           parseFloatField(data, "max_volume"),
+		MinLength:           parseFloatField(data, "min_length"),
+		MaxLength:           parseFloatField(data, "max_length"),
+		MinWidth:            parseFloatField(data, "min_width"),
+		MaxWidth:            parseFloatField(data, "max_width"),
+		MinHeight:           parseFloatField(data, "min_height"),
+		MaxHeight:           parseFloatField(data, "max_height"),
 		MinPricePerKm:       parseFloatField(data, "min_price_km"),
 		HotMinPricePerKm:    hotMinPriceKm,
 		TransportTypes:      parseStringSlice(data["transport_types"]),

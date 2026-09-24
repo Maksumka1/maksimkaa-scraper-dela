@@ -8,6 +8,7 @@ import hashlib
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -50,6 +51,10 @@ class CargoRequest:
     volume_m3: Optional[float]
     price_uah: Optional[int]
     price_per_km_uah: Optional[float]
+    length_m: Optional[float] = None
+    width_m: Optional[float] = None
+    height_m: Optional[float] = None
+    published_at: str = ""
     route_from_full: str = ""
     route_to_full: str = ""
     route_from_region: str = ""
@@ -594,6 +599,32 @@ class DellaMobileScraper:
             )
             cargo_desc = self._node_text(cargo_nodes[0]) if cargo_nodes else ""
 
+            request_text_nodes = card.xpath(
+                './/div[contains(concat(" ", normalize-space(@class), " "), " request_text ")]//text()'
+            )
+            request_text = " ".join(" ".join(request_text_nodes).split()) if request_text_nodes else ""
+
+            def extract_dimension(label: str) -> Optional[float]:
+                match = re.search(
+                    rf"{label}\s*=\s*([0-9]+(?:[.,][0-9]+)?)\s*м?",
+                    request_text,
+                    flags=re.IGNORECASE,
+                )
+                if not match:
+                    return None
+                return self._extract_clean_number(match.group(1))
+
+            length_m = extract_dimension("дов")
+            width_m = extract_dimension("шир")
+            height_m = extract_dimension("вис")
+            published_at = (
+                datetime.fromtimestamp(dateup_ts, timezone.utc)
+                .astimezone(ZoneInfo("Europe/Kyiv"))
+                .strftime("%d.%m.%Y %H:%M:%S")
+                if dateup_ts > 0
+                else ""
+            )
+
             price_main_node = card.xpath(
                 './/div[contains(concat(" ", normalize-space(@class), " "), " price_main ")]'
                 '/text() | '
@@ -648,6 +679,10 @@ class DellaMobileScraper:
                     volume_m3=volume_val,
                     price_uah=price_val,
                     price_per_km_uah=price_km_val,
+                    length_m=length_m,
+                    width_m=width_m,
+                    height_m=height_m,
+                    published_at=published_at,
                     tags=tags,
                     transport_types=transport_types,
                 )
