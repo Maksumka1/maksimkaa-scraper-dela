@@ -116,8 +116,9 @@ type CargoPayload struct {
 }
 
 type TelegramTask struct {
-	ChatID int64
-	Text   string
+	ChatID    int64
+	Text      string
+	OrderURLs []string
 }
 
 type TelegramAPIResponse struct {
@@ -370,8 +371,18 @@ func main() {
 							}
 						}
 
+						orderURLs := []string{}
+						if cargo.OrderURL != "" {
+							orderURLs = append(orderURLs, cargo.OrderURL)
+						}
+						for _, candidate := range returnCandidates {
+							if candidate != nil && candidate.OrderURL != "" {
+								orderURLs = append(orderURLs, candidate.OrderURL)
+							}
+						}
+
 						select {
-						case tgQueue <- TelegramTask{ChatID: f.ChatID, Text: text}:
+						case tgQueue <- TelegramTask{ChatID: f.ChatID, Text: text, OrderURLs: orderURLs}:
 						default:
 							log.Printf("Головна черга переповнена, пропуск для %d", f.ChatID)
 						}
@@ -488,12 +499,29 @@ func sendHTTPRequest(
 	rdb *redis.Client,
 	store *FilterStore,
 ) {
-	body, _ := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"chat_id":                  task.ChatID,
 		"text":                     task.Text,
 		"parse_mode":               "HTML",
 		"disable_web_page_preview": true,
-	})
+	}
+	if len(task.OrderURLs) > 0 {
+		buttons := make([][]map[string]string, 0, len(task.OrderURLs))
+		for index, orderURL := range task.OrderURLs {
+			label := "🔗 Відкрити замовлення на Della"
+			if len(task.OrderURLs) > 1 {
+				label = fmt.Sprintf("🔗 Della #%d", index+1)
+			}
+			buttons = append(buttons, []map[string]string{{
+				"text": label,
+				"url":  orderURL,
+			}})
+		}
+		payload["reply_markup"] = map[string]interface{}{
+			"inline_keyboard": buttons,
+		}
+	}
+	body, _ := json.Marshal(payload)
 
 	resp, err := client.Post(url, "application/json", bytes.NewBuffer(body))
 	if err != nil {
@@ -628,8 +656,8 @@ func saveBatchToPostgres(ctx context.Context, db *pgxpool.Pool, items []*CargoPa
 			tags = EXCLUDED.tags,
 			transport_types = EXCLUDED.transport_types,
 			length_m = EXCLUDED.length_m,
-		    width_m = EXCLUDED.width_m,
-		    height_m = EXCLUDED.height_m,
+			width_m = EXCLUDED.width_m,
+			height_m = EXCLUDED.height_m,
 			published_relative = EXCLUDED.published_relative,
 			published_at = EXCLUDED.published_at;
 	`
@@ -847,15 +875,62 @@ func hasTransportIntersection(cargoTypes, filterTypes []string) bool {
 	return false
 }
 
+func formatUAH(value float64) string {
+	text := fmt.Sprintf("%.0f", value)
+	for i := len(text) - 3; i > 0; i -= 3 {
+		text = text[:i] + " " + text[i:]
+	}
+	return text
+}
+
+func formatPublishedTime(value string) string {
+	value = strings.TrimSpace(value)
+	parts := strings.Fields(value)
+	if len(parts) > 0 {
+		last := parts[len(parts)-1]
+		if len(last) == 8 && strings.Count(last, ":") == 2 {
+			return last
+		}
+	}
+	return value
+}
+
+func formatTags(tags []string) string {
+	if len(tags) == 0 {
+		return "🏷 <code>Теги не вказані</code>"
+	}
+	parts := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("<code>%s</code>", escapeTelegramHTML(strings.ToUpper(tag))))
+	}
+	if len(parts) == 0 {
+		return "🏷 <code>Теги не вказані</code>"
+	}
+	return "🏷 " + strings.Join(parts, " ")
+}
+
 func formatAlert(c *CargoPayload, f *UserFilter) string {
 	var b strings.Builder
 	hot := f != nil && f.HotMinPricePerKm > 0 && c.PricePerKmUAH >= f.HotMinPricePerKm
 	if hot {
 		b.WriteString("🔥 <b>ГАРЯЧА СТАВКА</b>\n")
 	}
-	fmt.Fprintf(&b, "📍 <b>%s ➔ %s</b> · %d км\n", escapeTelegramHTML(c.RouteFrom), escapeTelegramHTML(c.RouteTo), c.DistanceKm)
-	fmt.Fprintf(&b, "📦 %s\n", escapeTelegramHTML(c.CargoType))
-	fmt.Fprintf(&b, "⚖️ %.1f т · %.1f м³\n", c.WeightT, c.VolumeM3)
+	fmt.Fprintf(&b, "📍 <b>%s ➔ %s</b> <code>%d КМ</code>\n", escapeTelegramHTML(strings.ToUpper(c.RouteFrom)), escapeTelegramHTML(strings.ToUpper(c.RouteTo)), c.DistanceKm)
+	if c.PriceUAH > 0 && c.PricePerKmUAH > 0 {
+		fmt.Fprintf(&b, "💰 <b>%s ГРН</b> <code>(%.2f ГРН/КМ)</code>\n", formatUAH(c.PriceUAH), c.PricePerKmUAH)
+	} else if c.PriceUAH > 0 {
+		fmt.Fprintf(&b, "💰 <b>%s ГРН</b>\n", formatUAH(c.PriceUAH))
+	} else {
+		b.WriteString("💰 <b>СТАВКА НЕ ВКАЗАНА</b>\n")
+	}
+	b.WriteString(formatTags(c.Tags))
+	b.WriteString("\n\n<blockquote>\n")
+	fmt.Fprintf(&b, "📦 <i>Вантаж:</i> %s\n", escapeTelegramHTML(c.CargoType))
+	fmt.Fprintf(&b, "⚖️ <i>Вага / Об'єм:</i> %.1f т · %.1f м³\n", c.WeightT, c.VolumeM3)
 
 	dimensions := []string{}
 	if c.LengthM > 0 {
@@ -868,31 +943,16 @@ func formatAlert(c *CargoPayload, f *UserFilter) string {
 		dimensions = append(dimensions, fmt.Sprintf("вис %.2f м", c.HeightM))
 	}
 	if len(dimensions) == 0 {
-		b.WriteString("📐 Габарити не вказані\n")
+		b.WriteString("📐 <i>Габарити:</i> не вказані\n")
 	} else {
-		fmt.Fprintf(&b, "📐 %s\n", escapeTelegramHTML(strings.Join(dimensions, " · ")))
+		fmt.Fprintf(&b, "📐 <i>Габарити:</i> %s\n", escapeTelegramHTML(strings.Join(dimensions, " · ")))
 	}
-	if len(c.TransportTypes) > 0 {
-		fmt.Fprintf(&b, "🚛 %s\n", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
+	fmt.Fprintf(&b, "🚛 <i>Тип авто:</i> %s\n", escapeTelegramHTML(strings.Join(c.TransportTypes, ", ")))
+	fmt.Fprintf(&b, "⏱ <i>Опубліковано:</i> %s", escapeTelegramHTML(c.PublishedRelative))
+	if c.PublishedAt != "" {
+		fmt.Fprintf(&b, " (%s)", escapeTelegramHTML(formatPublishedTime(c.PublishedAt)))
 	}
-	b.WriteString("\n")
-
-	if c.PriceUAH > 0 && c.PricePerKmUAH > 0 {
-		fmt.Fprintf(&b, "💰 <b>%.0f грн</b> · <b>%.2f грн/км</b>\n", c.PriceUAH, c.PricePerKmUAH)
-	} else if c.PriceUAH > 0 {
-		fmt.Fprintf(&b, "💰 <b>%.0f грн</b> · ставка/км не вказана\n", c.PriceUAH)
-	} else {
-		b.WriteString("💰 Ставка не вказана\n")
-	}
-
-	if c.PublishedRelative != "" && c.PublishedAt != "" {
-		fmt.Fprintf(&b, "⏱ %s · %s", escapeTelegramHTML(c.PublishedRelative), escapeTelegramHTML(c.PublishedAt))
-	} else if c.PublishedRelative != "" {
-		fmt.Fprintf(&b, "⏱ %s", escapeTelegramHTML(c.PublishedRelative))
-	} else if c.PublishedAt != "" {
-		fmt.Fprintf(&b, "⏱ %s", escapeTelegramHTML(c.PublishedAt))
-	}
-
+	b.WriteString("\n</blockquote>")
 	return b.String()
 }
 

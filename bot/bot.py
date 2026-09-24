@@ -340,7 +340,7 @@ def build_archive_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
         SELECT route_from, route_to, order_url,route_from_full, route_to_full,
                route_from_region, route_to_region, distance_km, cargo_type,
                weight_t, volume_m3, length_m, width_m, height_m,
-               price_uah, price_per_km_uah, transport_types, published_relative, published_at, created_at
+               price_uah, price_per_km_uah, tags, transport_types, published_relative, published_at, created_at
         FROM cargo_history
         WHERE {' AND '.join(clauses)}
         ORDER BY created_at DESC
@@ -350,6 +350,7 @@ def build_archive_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
 
 def format_archive_row(row: asyncpg.Record, filter_data: Dict[str, Any]) -> str:
     transport = row["transport_types"] or []
+    tags = row["tags"] or []
     hot_min = filter_data.get("hot_min_price_km")
     rate = row["price_per_km_uah"]
     is_hot = hot_min is not None and float(hot_min) > 0 and rate is not None and float(rate) >= float(hot_min)
@@ -359,40 +360,53 @@ def format_archive_row(row: asyncpg.Record, filter_data: Dict[str, Any]) -> str:
         value = row[key]
         if value is not None and float(value) > 0:
             dimensions.append(f"{label} {float(value):.2f} м")
-    dimension_text = " · ".join(dimensions) if dimensions else "Габарити не вказані"
+    dimension_text = " · ".join(dimensions) if dimensions else "не вказані"
+
+    route = f"{str(row['route_from']).upper()} ➔ {str(row['route_to']).upper()}"
+    price_text = (
+        f"{int(round(float(row['price_uah']))):,}".replace(",", " ") + " ГРН"
+        if row["price_uah"] is not None and float(row["price_uah"]) > 0
+        else "СТАВКА НЕ ВКАЗАНА"
+    )
+    rate_text = f"({float(rate):.2f} ГРН/КМ)" if rate is not None and float(rate) > 0 else ""
 
     lines = [
-        ("🔥 <b>Гаряча ставка</b> · " if is_hot else "🕘 ") + "<b>Архів 48г</b>",
-        f"📍 <b>{html.escape(str(row['route_from']))} ➔ {html.escape(str(row['route_to']))}</b> · {row['distance_km'] or 0} км",
-        f"📦 {html.escape(str(row['cargo_type'] or '—'))}",
-        f"⚖️ {row['weight_t'] if row['weight_t'] is not None else '—'} т · {row['volume_m3'] if row['volume_m3'] is not None else '—'} м³",
+        ("🔥 <b>ГАРЯЧА СТАВКА</b> · " if is_hot else "") + f"📍 <b>{html.escape(route)}</b> <code>{row['distance_km'] or 0} КМ</code>",
+        f"💰 <b>{html.escape(price_text)}</b>" + (f" <code>{html.escape(rate_text)}</code>" if rate_text else ""),
     ]
 
-    lines.append(f"📐 {html.escape(dimension_text)}")
-    if transport:
-        lines.append(f"🚛 {html.escape(', '.join(str(x) for x in transport))}")
-    lines.append("")
-
-    if row["price_uah"] is not None and float(row["price_uah"]) > 0 and rate is not None and float(rate) > 0:
-        lines.append(f"💰 <b>{row['price_uah']:.0f} грн</b> · <b>{rate:.2f} грн/км</b>")
-    elif row["price_uah"] is not None and float(row["price_uah"]) > 0:
-        lines.append(f"💰 <b>{row['price_uah']:.0f} грн</b> · ставка/км не вказана")
+    if tags:
+        lines.append("🏷 " + " ".join(f"<code>{html.escape(str(tag).upper())}</code>" for tag in tags))
     else:
-        lines.append("💰 Ставка не вказана")
+        lines.append("🏷 <code>Теги не вказані</code>")
 
-    if row["order_url"]:
-        lines.append(f'🔗 <a href="{html.escape(str(row["order_url"]), quote=True)}">Відкрити замовлення на Della</a>')
+    lines.append("<blockquote>")
+    lines.extend([
+        f"📦 <i>Вантаж:</i> {html.escape(str(row['cargo_type'] or '—'))}",
+        f"⚖️ <i>Вага / Об'єм:</i> {row['weight_t'] if row['weight_t'] is not None else '—'} т · {row['volume_m3'] if row['volume_m3'] is not None else '—'} м³",
+        f"🚛 <i>Тип авто:</i> {html.escape(', '.join(str(x) for x in transport) if transport else 'не вказано')}",
+        f"📐 <i>Габарити:</i> {html.escape(dimension_text)}",
+    ])
 
     relative = str(row["published_relative"] or "")
     exact = str(row["published_at"] or "")
-    if relative and exact:
-        lines.append(f"⏱ {html.escape(relative)} · {html.escape(exact)}")
-    elif relative:
-        lines.append(f"⏱ {html.escape(relative)}")
-    elif exact:
-        lines.append(f"⏱ {html.escape(exact)}")
-    
+    exact_time = exact[-8:] if len(exact) >= 8 else exact
+    published = f"{relative} ({exact_time})" if relative and exact_time else (relative or exact_time)
+    lines.append(f"⏱ <i>Опубліковано:</i> {html.escape(published)}")
+    lines.append("</blockquote>")
+
     return "\n".join(lines)
+
+
+def della_keyboard(urls: List[str]) -> Optional[InlineKeyboardMarkup]:
+    urls = [url for url in urls if url]
+    if not urls:
+        return None
+    buttons = []
+    for index, url in enumerate(urls, 1):
+        text = "🔗 Відкрити замовлення на Della" if len(urls) == 1 else f"🔗 Della #{index}"
+        buttons.append([InlineKeyboardButton(text=text, url=url)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def send_archive(message: types.Message, filter_data: Dict[str, Any], *, header: bool = True) -> int:
@@ -405,8 +419,9 @@ async def send_archive(message: types.Message, filter_data: Dict[str, Any], *, h
         await message.answer("ℹ️ За останні 48 годин відповідних вантажів не знайдено.", reply_markup=bottom_menu())
         return 0
 
-    chunks: List[str] = []
+    chunks: List[Tuple[str, List[str]]] = []
     current = ""
+    current_urls: List[str] = []
     if header:
         current = "📋 <b>Вантажі за останні 48 годин</b>\n"
         current += f"Знайдено: <b>{len(rows)}</b>\n\n"
@@ -414,14 +429,22 @@ async def send_archive(message: types.Message, filter_data: Dict[str, Any], *, h
     for row in rows:
         block = format_archive_row(row, filter_data)
         if len(current) + len(block) + 2 > ARCHIVE_MESSAGE_LIMIT and current.strip():
-            chunks.append(current.rstrip())
+            chunks.append((current.rstrip(), current_urls))
             current = ""
+            current_urls = []
         current += block + "\n\n"
+        if row["order_url"]:
+            current_urls.append(str(row["order_url"]))
     if current.strip():
-        chunks.append(current.rstrip())
+        chunks.append((current.rstrip(), current_urls))
 
-    for index, chunk in enumerate(chunks):
-        await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
+    for index, (chunk, urls) in enumerate(chunks):
+        await message.answer(
+            chunk,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=della_keyboard(urls),
+        )
         if index < len(chunks) - 1:
             await asyncio.sleep(ARCHIVE_PAUSE_SEC)
 
@@ -550,7 +573,6 @@ def bottom_menu() -> ReplyKeyboardMarkup:
     )
 
 
-
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -669,13 +691,13 @@ def render_filter(filter_data: Dict[str, Any]) -> str:
     return (
         "<b>📋 Поточний фільтр</b>\n\n"
         f"📍 <b>Звідки:</b> {html.escape(loc('from'))}\n"
-        f"🎯 <b>Куди:</b> {html.escape(loc('to'))}\n"
+        f"🎯 <b>Куди:</b> {html.escape(loc('to'))}\n\n"
         f"⚖️ <b>Маса:</b> {html.escape(range_text('min_weight', 'max_weight', 'т'))}\n"
         f"📐 <b>Об'єм:</b> {html.escape(range_text('min_volume', 'max_volume', 'м³'))}\n"
         f"📏 <b>Габарити:</b> дов {html.escape(range_text('min_length', 'max_length', 'м'))}; шир {html.escape(range_text('min_width', 'max_width', 'м'))}; вис {html.escape(range_text('min_height', 'max_height', 'м'))}\n"
-        f"🚛 <b>Транспорт:</b> {html.escape(', '.join(transports) if transports else 'будь-який')}\n"
+        f"🚛 <b>Транспорт:</b> {html.escape(', '.join(transports) if transports else 'будь-який')}\n\n"
         f"💵 <b>Мін. ставка:</b> {filter_data.get('min_price_km') if filter_data.get('min_price_km') is not None else 'будь-яка'} грн/км\n"
-        f"🔥 <b>Гаряча ставка:</b> {html.escape(hot_text)}\n"
+        f"🔥 <b>Гаряча ставка:</b> {html.escape(hot_text)}\n\n"
         f"🔄 <b>Зворотний пошук:</b> {'увімкнений' if filter_data.get('return_search_enabled') else 'вимкнений'}\n"
         f"🚛 <b>Тільки туди + назад:</b> {'так' if filter_data.get('round_trip_only') else 'ні'}"
     )
@@ -933,6 +955,7 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
 
     await callback.answer("Невідома команда")
 
+
 @dp.message(F.text.in_({
     "⚙️ Налаштувати фільтр",
     "📋 Мій фільтр",
@@ -1005,8 +1028,6 @@ async def bottom_menu_handler(message: types.Message, state: FSMContext):
             await pipe.execute()
         await state.clear()
         await message.answer("🗑 Фільтр очищено.", reply_markup=bottom_menu())
-
-
 
 
 @dp.message(FilterWizard.waiting_value, F.text)
@@ -1125,4 +1146,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

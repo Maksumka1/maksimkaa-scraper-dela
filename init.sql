@@ -27,10 +27,10 @@ CREATE TABLE IF NOT EXISTS cargo_history (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-+ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS length_m NUMERIC(6, 2);
-+ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS width_m NUMERIC(6, 2);
-+ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS height_m NUMERIC(6, 2);
-+ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS published_at VARCHAR(32);
+ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS length_m NUMERIC(6, 2);
+ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS width_m NUMERIC(6, 2);
+ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS height_m NUMERIC(6, 2);
+ALTER TABLE cargo_history ADD COLUMN IF NOT EXISTS published_at VARCHAR(32);
 
 -- Довідник населених пунктів та областей
 CREATE TABLE IF NOT EXISTS geo_locations (
