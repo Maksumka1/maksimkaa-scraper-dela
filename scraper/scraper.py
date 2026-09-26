@@ -28,6 +28,7 @@ logger = logging.getLogger("DellaParser")
 # Ініціалізація підключення до Redis із параметрів оточення
 REDIS_ADDR = os.getenv("REDIS_ADDR", "redis:6379")
 REDIS_PASS = os.getenv("REDIS_PASSWORD")
+DEBUG_DEDUP = os.getenv("DEBUG_DEDUP", "0") == "1"
 
 host, port = REDIS_ADDR.split(":")
 redis_client = redis.Redis(
@@ -432,10 +433,54 @@ class DellaMobileScraper:
 
         for item in items:
             request_id = item.request_id
+
+            # -------------------------------------------------------#
+            # Logging the parsed item details for debugging purposes #
+            # -------------------------------------------------------#
+            if DEBUG_DEDUP:
+                logger.info(
+                    "[PARSED] id=%s | %s→%s | %s км | %s т | %s м³ | %s грн | %s грн/км | dims=%s/%s/%s | transport=%s | tags=%s",
+                    item.request_id,
+                    item.route_from,
+                    item.route_to,
+                    item.distance_km,
+                    item.weight_t,
+                    item.volume_m3,
+                    item.price_uah,
+                    item.price_per_km_uah,
+                    item.length_m,
+                    item.width_m,
+                    item.height_m,
+                    ",".join(item.transport_types),
+                    ",".join(item.tags),
+                )
+            # -------------------------------------------------------#
+            #                      Eng Logging                       #
+            # -------------------------------------------------------#
+
+
+
             if request_id in batch_seen or request_id in self._seen_ids:
+                # -------------------------------------------------------#
+                # Logging the parsed item details for debugging purposes #
+                # -------------------------------------------------------#
+                if DEBUG_DEDUP:
+                    reason = "batch" if request_id in batch_seen else "seen_cache"
+                    logger.info("[DEDUP] DUP id=%s | %s", request_id, reason)
+                    # -------------------------------------------------------#
+                    #                      Eng Logging                       #
+                    # -------------------------------------------------------#
                 continue
             batch_seen.add(request_id)
             new_items.append(item)
+            # -------------------------------------------------------#
+            # Logging the parsed item details for debugging purposes #
+            # -------------------------------------------------------#
+            if DEBUG_DEDUP:
+                logger.info("[DEDUP] NEW id=%s", request_id)
+            # -------------------------------------------------------#
+            #                      Eng Logging                       #
+            # -------------------------------------------------------#
 
         self._remember_ids([item.request_id for item in new_items])
         return new_items
@@ -802,12 +847,20 @@ class DellaMobileScraper:
 
                 for item in new_items:
                     payload = item.to_redis_payload()
-                    redis_client.xadd(
-                        "stream:della:requests",
-                        payload,
-                        maxlen=20000,
-                        approximate=True,
-                    )
+                    try:
+                        stream_id = redis_client.xadd(
+                            "stream:della:requests",
+                            payload,
+                            maxlen=20000,
+                            approximate=True,
+                        )
+                        if DEBUG_DEDUP:
+                            logger.info("[REDIS] OK id=%s | stream=%s", item.request_id, stream_id)
+                    except Exception as exc:
+                        if DEBUG_DEDUP:
+                            logger.error("[REDIS] ERROR id=%s | %s", item.request_id, exc)
+                        raise
+                    
             except KeyboardInterrupt:
                 logger.info("Зупинка парсера.")
                 break

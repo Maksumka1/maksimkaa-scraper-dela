@@ -113,6 +113,7 @@ services:
     environment:
       - REDIS_ADDR=redis:6379
       - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - DEBUG_DEDUP=${DEBUG_DEDUP:-0}
     depends_on:
       redis:
         condition: service_healthy
