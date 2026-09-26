@@ -363,6 +363,7 @@ def build_archive_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
         FROM cargo_history
         WHERE {' AND '.join(clauses)}
         ORDER BY created_at DESC
+        LIMIT 10
     """
     return query, args
 

@@ -123,7 +123,7 @@ type TelegramTask struct {
 	OrderURLs []string
 }
 
-const debugTelegramFlow = true
+const debugTelegramFlow = false
 
 func tgDebug(format string, args ...interface{}) {
 	if debugTelegramFlow {
