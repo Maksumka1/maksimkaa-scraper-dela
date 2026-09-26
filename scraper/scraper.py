@@ -440,10 +440,6 @@ class DellaMobileScraper:
             batch_seen.add(request_id)
             new_items.append(item)
 
-            # Логуємо виключно нові оголошення: тільки маршрут і ціна
-            price_str = f"{item.price_uah} грн" if item.price_uah is not None else "договірна"
-            logger.info("[NEW] %s → %s | %s", item.route_from, item.route_to, price_str)
-
         self._remember_ids([item.request_id for item in new_items])
         return new_items
     
