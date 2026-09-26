@@ -117,9 +117,18 @@ type CargoPayload struct {
 }
 
 type TelegramTask struct {
+	RequestID string
 	ChatID    int64
 	Text      string
 	OrderURLs []string
+}
+
+const debugTelegramFlow = true
+
+func tgDebug(format string, args ...interface{}) {
+	if debugTelegramFlow {
+		log.Printf("[TGDBG] "+format, args...)
+	}
 }
 
 type TelegramAPIResponse struct {
@@ -294,6 +303,7 @@ func main() {
 				for _, msg := range entries[0].Messages {
 					cargo, err := parsePayload(msg.Values)
 					if err != nil || cargo.RequestID == "" {
+						tgDebug("request=? stream=%s stage=DROP reason=parse", msg.ID)
 						// A malformed record cannot be processed successfully later.
 						immediateAckIDs = append(immediateAckIDs, msg.ID)
 						continue
@@ -306,10 +316,12 @@ func main() {
 						continue
 					}
 					if exists > 0 {
+						tgDebug("request=%s stream=%s stage=DROP reason=engine_dedup", cargo.RequestID, msg.ID)
 						immediateAckIDs = append(immediateAckIDs, msg.ID)
 						continue
 					}
 
+					tgDebug("request=%s stream=%s stage=NEW", cargo.RequestID, msg.ID)
 					toSave = append(toSave, cargo)
 					pendingMsgIDs = append(pendingMsgIDs, msg.ID)
 				}
@@ -340,13 +352,16 @@ func main() {
 					}
 					ackAfterSave = append(ackAfterSave, pendingMsgIDs[i])
 					if !wasSet {
+						tgDebug("request=%s stage=DROP reason=engine_SetNX_false", cargo.RequestID)
 						continue
 					}
 
 					for _, f := range store.GetAll() {
 						if !match(cargo, f) {
+							tgDebug("request=%s chat=%d stage=MATCH result=NO", cargo.RequestID, f.ChatID)
 							continue
 						}
+						tgDebug("request=%s chat=%d stage=MATCH result=YES", cargo.RequestID, f.ChatID)
 
 						text := formatAlert(cargo, f)
 						var returnCandidates []*CargoPayload
@@ -383,9 +398,11 @@ func main() {
 						}
 
 						select {
-						case tgQueue <- TelegramTask{ChatID: f.ChatID, Text: text, OrderURLs: orderURLs}:
+						case tgQueue <- TelegramTask{RequestID: cargo.RequestID, ChatID: f.ChatID, Text: text, OrderURLs: orderURLs}:
+							tgDebug("request=%s chat=%d stage=TG_QUEUE status=OK", cargo.RequestID, f.ChatID)
 						default:
 							log.Printf("Головна черга переповнена, пропуск для %d", f.ChatID)
+							tgDebug("request=%s chat=%d stage=TG_QUEUE status=DROP", cargo.RequestID, f.ChatID)
 						}
 					}
 				}
@@ -437,11 +454,12 @@ func startTelegramDispatcher(
 		workerQueues[i] = make(chan TelegramTask, 500)
 		workersWg.Add(1)
 
-		go func(wQueue <-chan TelegramTask) {
+		go func(workerID int, wQueue <-chan TelegramTask) {
 			defer workersWg.Done()
 			lastSentPerChat := make(map[int64]time.Time)
 
 			for task := range wQueue {
+				tgDebug("request=%s chat=%d worker=%d stage=WORKER_IN", task.RequestID, task.ChatID, workerID)
 				// 1. Індивідуальний ліміт на користувача (1 повідомлення / 1.1 сек)
 				if lastSent, exists := lastSentPerChat[task.ChatID]; exists {
 					elapsed := time.Since(lastSent)
@@ -466,9 +484,10 @@ func startTelegramDispatcher(
 
 				lastSentPerChat[task.ChatID] = time.Now()
 
+				tgDebug("request=%s chat=%d worker=%d stage=SEND", task.RequestID, task.ChatID, workerID)
 				sendHTTPRequest(ctx, client, url, task, rdb, store)
 			}
-		}(workerQueues[i])
+		}(i, workerQueues[i])
 	}
 
 	// Маршрутизація повідомлень у відповідний шард за ChatID
@@ -480,8 +499,9 @@ func startTelegramDispatcher(
 
 		select {
 		case workerQueues[shardIdx] <- task:
+			tgDebug("request=%s chat=%d worker=%d stage=SHARD status=OK", task.RequestID, task.ChatID, shardIdx)
 		default:
-			log.Printf("Шард %d переповнений! Пропуск сповіщення для %d", shardIdx, task.ChatID)
+			tgDebug("request=%s chat=%d worker=%d stage=SHARD status=DROP", task.RequestID, task.ChatID, shardIdx)
 		}
 	}
 
@@ -526,6 +546,7 @@ func sendHTTPRequest(
 
 	resp, err := client.Post(url, "application/json", bytes.NewBuffer(body))
 	if err != nil {
+		tgDebug("request=%s chat=%d stage=TELEGRAM status=HTTP_ERROR error=%v", task.RequestID, task.ChatID, err)
 		log.Printf("Помилка відправки HTTP в Telegram: %v", err)
 		return
 	}
@@ -534,11 +555,13 @@ func sendHTTPRequest(
 	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
+		tgDebug("request=%s chat=%d stage=TELEGRAM status=200", task.RequestID, task.ChatID)
 		return
 	}
 
 	var apiResp TelegramAPIResponse
 	_ = json.Unmarshal(respBytes, &apiResp)
+	tgDebug("request=%s chat=%d stage=TELEGRAM status=%d error=%s", task.RequestID, task.ChatID, resp.StatusCode, apiResp.Description)
 
 	switch resp.StatusCode {
 	case http.StatusTooManyRequests:
