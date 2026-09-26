@@ -434,57 +434,19 @@ class DellaMobileScraper:
         for item in items:
             request_id = item.request_id
 
-            # -------------------------------------------------------#
-            # Logging the parsed item details for debugging purposes #
-            # -------------------------------------------------------#
-            if DEBUG_DEDUP:
-                logger.info(
-                    "[PARSED] id=%s | %s→%s | %s км | %s т | %s м³ | %s грн | %s грн/км | dims=%s/%s/%s | transport=%s | tags=%s",
-                    item.request_id,
-                    item.route_from,
-                    item.route_to,
-                    item.distance_km,
-                    item.weight_t,
-                    item.volume_m3,
-                    item.price_uah,
-                    item.price_per_km_uah,
-                    item.length_m,
-                    item.width_m,
-                    item.height_m,
-                    ",".join(item.transport_types),
-                    ",".join(item.tags),
-                )
-            # -------------------------------------------------------#
-            #                      Eng Logging                       #
-            # -------------------------------------------------------#
-
-
-
             if request_id in batch_seen or request_id in self._seen_ids:
-                # -------------------------------------------------------#
-                # Logging the parsed item details for debugging purposes #
-                # -------------------------------------------------------#
-                if DEBUG_DEDUP:
-                    reason = "batch" if request_id in batch_seen else "seen_cache"
-                    logger.info("[DEDUP] DUP id=%s | %s", request_id, reason)
-                    # -------------------------------------------------------#
-                    #                      Eng Logging                       #
-                    # -------------------------------------------------------#
                 continue
+
             batch_seen.add(request_id)
             new_items.append(item)
-            # -------------------------------------------------------#
-            # Logging the parsed item details for debugging purposes #
-            # -------------------------------------------------------#
-            if DEBUG_DEDUP:
-                logger.info("[DEDUP] NEW id=%s", request_id)
-            # -------------------------------------------------------#
-            #                      Eng Logging                       #
-            # -------------------------------------------------------#
+
+            # Логуємо виключно нові оголошення: тільки маршрут і ціна
+            price_str = f"{item.price_uah} грн" if item.price_uah is not None else "договірна"
+            logger.info("[NEW] %s → %s | %s", item.route_from, item.route_to, price_str)
 
         self._remember_ids([item.request_id for item in new_items])
         return new_items
-
+    
     @classmethod
     def _validate_response_host(cls, response) -> None:
         final_url = getattr(response, "url", None)
@@ -860,7 +822,7 @@ class DellaMobileScraper:
                         if DEBUG_DEDUP:
                             logger.error("[REDIS] ERROR id=%s | %s", item.request_id, exc)
                         raise
-                    
+
             except KeyboardInterrupt:
                 logger.info("Зупинка парсера.")
                 break
