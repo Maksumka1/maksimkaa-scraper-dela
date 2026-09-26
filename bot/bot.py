@@ -652,16 +652,20 @@ def main_menu() -> InlineKeyboardMarkup:
 def numeric_preset_menu(kind: str) -> InlineKeyboardMarkup:
     presets = {
         "weight": [
-            ("1.5 т", "preset:weight:1.5"),
-            ("3 т", "preset:weight:3"),
-            ("5 т", "preset:weight:5"),
-            ("10 т", "preset:weight:10"),
+            ("до 1.5 т", "preset:weight::1.5"),
+            ("1.5–3 т", "preset:weight:1.5:3"),
+            ("3–5 т", "preset:weight:3:5"),
+            ("5–10 т", "preset:weight:5:10"),
+            ("10–20 т", "preset:weight:10:20"),
+            ("від 20 т", "preset:weight:20:"),
         ],
         "volume": [
-            ("20 м³", "preset:volume:20"),
-            ("40 м³", "preset:volume:40"),
-            ("60 м³", "preset:volume:60"),
-            ("80 м³", "preset:volume:80"),
+            ("до 20 м³", "preset:volume::20"),
+            ("20–40 м³", "preset:volume:20:40"),
+            ("40–60 м³", "preset:volume:40:60"),
+            ("60–80 м³", "preset:volume:60:80"),
+            ("80–120 м³", "preset:volume:80:120"),
+            ("від 120 м³", "preset:volume:120:"),
         ],
         "price": [
             ("20 грн/км", "preset:price:20"),
@@ -671,8 +675,8 @@ def numeric_preset_menu(kind: str) -> InlineKeyboardMarkup:
         ],
     }
     titles = {
-        "weight": "⚖️ <b>Мінімальна маса</b>",
-        "volume": "📐 <b>Мінімальний об'єм</b>",
+        "weight": "⚖️ <b>Швидкий вибір маси</b>",
+        "volume": "📐 <b>Швидкий вибір об'єму</b>",
         "price": "💵 <b>Мінімальна ставка / км</b>",
     }
     rows = []
@@ -1039,8 +1043,17 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
         return
     
     if data.startswith("preset:"):
-        _, action, raw_value = (data.split(":", 2) + [""])[:3]
+        parts = data.split(":")
+        if len(parts) < 3:
+            await callback.answer("Невідомий preset", show_alert=True)
+            return
+
+        _, action = parts[:2]
         if action == "clear":
+            if len(parts) != 3:
+                await callback.answer("Невідомий preset", show_alert=True)
+                return
+            raw_value = parts[2]
             if raw_value == "weight":
                 filter_data["min_weight"] = None
                 filter_data["max_weight"] = None
@@ -1052,13 +1065,33 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
             else:
                 await callback.answer("Невідомий preset", show_alert=True)
                 return
-        elif action == "weight":
-            filter_data["min_weight"] = safe_float(raw_value)
-            filter_data["max_weight"] = None
-        elif action == "volume":
-            filter_data["min_volume"] = safe_float(raw_value)
-            filter_data["max_volume"] = None
+        elif action in {"weight", "volume"}:
+            if len(parts) != 4:
+                await callback.answer("Невідомий preset", show_alert=True)
+                return
+
+            min_value = safe_float(parts[2]) if parts[2] else None
+            max_value = safe_float(parts[3]) if parts[3] else None
+
+            if min_value is None and max_value is None:
+                await callback.answer("Невідомий preset", show_alert=True)
+                return
+
+            if min_value is not None and max_value is not None and min_value > max_value:
+                await callback.answer("Невідомий preset", show_alert=True)
+                return
+
+            if action == "weight":
+                filter_data["min_weight"] = min_value
+                filter_data["max_weight"] = max_value
+            else:
+                filter_data["min_volume"] = min_value
+                filter_data["max_volume"] = max_value
         elif action == "price":
+            if len(parts) != 3:
+                await callback.answer("Невідомий preset", show_alert=True)
+                return
+            raw_value = parts[2]
             if raw_value == "+5":
                 filter_data["min_price_km"] = (filter_data.get("min_price_km") or 0) + 5
             else:
