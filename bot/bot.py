@@ -60,7 +60,7 @@ class FilterWizard(StatesGroup):
 
 def blank_filter() -> Dict[str, Any]:
     return {
-        "schema_version": "3",
+        "schema_version": "4",
         "route_from": "",
         "route_to": "",
         "from_all_ukraine": False,
@@ -82,6 +82,7 @@ def blank_filter() -> Dict[str, Any]:
         "transport_types": [],
         "min_price_km": None,
         "hot_min_price_km": 20.0,
+        "allow_incomplete_data": False,
         "return_search_enabled": False,
         "round_trip_only": False,
         "enabled": False,
@@ -158,6 +159,7 @@ def filter_from_redis(data: Dict[str, str]) -> Dict[str, Any]:
     result["min_price_km"] = safe_float(data.get("min_price_km"))
     hot_value = safe_float(data.get("hot_min_price_km"))
     result["hot_min_price_km"] = 20.0 if hot_value is None else hot_value
+    result["allow_incomplete_data"] = data.get("allow_incomplete_data") in {"1", "true", "yes"}
     result["return_search_enabled"] = data.get("return_search_enabled") in {"1", "true", "yes"}
     result["round_trip_only"] = data.get("round_trip_only") in {"1", "true", "yes"}
     result["enabled"] = data.get("enabled") in {"1", "true", "yes"}
@@ -181,7 +183,7 @@ def filter_to_redis(data: Dict[str, Any]) -> Dict[str, str]:
         return "" if value is None else str(float(value))
 
     return {
-        "schema_version": "3",
+        "schema_version": "4",
         "route_from": normalize_text(data.get("route_from", "")),
         "route_to": normalize_text(data.get("route_to", "")),
         "from_all_ukraine": "1" if data.get("from_all_ukraine") else "0",
@@ -203,6 +205,7 @@ def filter_to_redis(data: Dict[str, Any]) -> Dict[str, str]:
         "transport_types": json.dumps(transport_types, ensure_ascii=False),
         "min_price_km": numeric(data.get("min_price_km")),
         "hot_min_price_km": "0" if data.get("hot_min_price_km") is None else numeric(data.get("hot_min_price_km")),
+        "allow_incomplete_data": "1" if data.get("allow_incomplete_data") else "0",
         "return_search_enabled": "1" if (data.get("return_search_enabled") or data.get("round_trip_only")) else "0",
         "round_trip_only": "1" if data.get("round_trip_only") else "0",
         "enabled": "1" if data.get("enabled", True) else "0",
@@ -297,6 +300,7 @@ def build_archive_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
     min_volume = filter_data.get("min_volume")
     max_volume = filter_data.get("max_volume")
     min_price = filter_data.get("min_price_km")
+    allow_incomplete = bool(filter_data.get("allow_incomplete_data"))
 
     if min_weight is not None:
         args.append(min_weight)
@@ -322,14 +326,29 @@ def build_archive_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
         high = filter_data.get(max_key)
         if low is not None:
             args.append(low)
-            clauses.append(f"{col} >= ${len(args)}")
+            if allow_incomplete:
+                clauses.append(
+                    f"({col} IS NULL OR {col} <= 0 OR {col} >= ${len(args)})"
+                )
+            else:
+                clauses.append(f"{col} >= ${len(args)}")
         if high is not None:
             args.append(high)
-            clauses.append(f"{col} IS NOT NULL AND {col} <= ${len(args)}")
+            if allow_incomplete:
+                clauses.append(
+                    f"({col} IS NULL OR {col} <= 0 OR {col} <= ${len(args)})"
+                )
+            else:
+                clauses.append(f"{col} IS NOT NULL AND {col} <= ${len(args)}")
 
     if min_price is not None:
         args.append(min_price)
-        clauses.append(f"price_per_km_uah >= ${len(args)}")
+        if allow_incomplete:
+            clauses.append(
+                f"(price_per_km_uah IS NULL OR price_per_km_uah <= 0 OR price_per_km_uah >= ${len(args)})"
+            )
+        else:
+            clauses.append(f"price_per_km_uah >= ${len(args)}")
 
     transport_types = [normalize_text(x) for x in filter_data.get("transport_types", []) if normalize_text(x)]
     if transport_types:
@@ -376,9 +395,24 @@ def format_archive_row(row: asyncpg.Record, filter_data: Dict[str, Any]) -> str:
     ]
 
     if tags:
-        lines.append("🏷 " + " ".join(f"<code>{html.escape(str(tag).upper())}</code>" for tag in tags))
+        tag_badges = []
+
+        for tag in tags:
+            tag = str(tag).strip()
+            if not tag:
+                continue
+
+            tag_badges.append(
+                f"🏷️ <code>[{html.escape(tag)}]</code>"
+            )
+
+        lines.append(
+            " ".join(tag_badges)
+            if tag_badges
+            else "🏷️ <code>Теги не вказані</code>"
+        )
     else:
-        lines.append("🏷 <code>Теги не вказані</code>")
+        lines.append("🏷️ <code>Теги не вказані</code>")
 
     lines.append("<blockquote>")
     lines.extend([
@@ -481,16 +515,44 @@ def build_forecast_query(filter_data: Dict[str, Any]) -> Tuple[str, List[Any]]:
         legacy=filter_data.get("route_from", ""),
     )
 
-    for key, col in (("min_weight", "weight_t"), ("min_volume", "volume_m3"), ("min_length", "length_m"), ("min_width", "width_m"), ("min_height", "height_m"), ("min_price_km", "price_per_km_uah")):
+    allow_incomplete = bool(filter_data.get("allow_incomplete_data"))
+    for key, col in (("min_weight", "weight_t"), ("min_volume", "volume_m3")):
         value = filter_data.get(key)
         if value is not None:
             args.append(value)
             clauses.append(f"{col} >= ${len(args)}")
-    for key, col in (("max_weight", "weight_t"), ("max_volume", "volume_m3"), ("max_length", "length_m"), ("max_width", "width_m"), ("max_height", "height_m")):
+    for key, col in (("min_length", "length_m"), ("min_width", "width_m"), ("min_height", "height_m")):
         value = filter_data.get(key)
         if value is not None:
             args.append(value)
-            clauses.append(f"{col} IS NOT NULL AND {col} <= ${len(args)}")
+            if allow_incomplete:
+                clauses.append(f"({col} IS NULL OR {col} <= 0 OR {col} >= ${len(args)})")
+            else:
+                clauses.append(f"{col} >= ${len(args)}")
+
+    for key, col in (("max_weight", "weight_t"), ("max_volume", "volume_m3")):
+         value = filter_data.get(key)
+         if value is not None:
+             args.append(value)
+             clauses.append(f"{col} IS NOT NULL AND {col} <= ${len(args)}")
+
+    for key, col in (("max_length", "length_m"), ("max_width", "width_m"), ("max_height", "height_m")):
+        value = filter_data.get(key)
+        if value is not None:
+            args.append(value)
+            if allow_incomplete:
+                clauses.append(f"({col} IS NULL OR {col} <= 0 OR {col} <= ${len(args)})")
+            else:
+                clauses.append(f"{col} IS NOT NULL AND {col} <= ${len(args)}")
+
+    value = filter_data.get("min_price_km")
+    if value is not None:
+        args.append(value)
+        if allow_incomplete:
+            clauses.append(f"(price_per_km_uah IS NULL OR price_per_km_uah <= 0 OR price_per_km_uah >= ${len(args)})")
+        else:
+            clauses.append(f"price_per_km_uah >= ${len(args)}")
+
 
     transport_types = [normalize_text(x) for x in filter_data.get("transport_types", []) if normalize_text(x)]
     if transport_types:
@@ -587,6 +649,48 @@ def main_menu() -> InlineKeyboardMarkup:
     )
 
 
+def numeric_preset_menu(kind: str) -> InlineKeyboardMarkup:
+    presets = {
+        "weight": [
+            ("1.5 т", "preset:weight:1.5"),
+            ("3 т", "preset:weight:3"),
+            ("5 т", "preset:weight:5"),
+            ("10 т", "preset:weight:10"),
+        ],
+        "volume": [
+            ("20 м³", "preset:volume:20"),
+            ("40 м³", "preset:volume:40"),
+            ("60 м³", "preset:volume:60"),
+            ("80 м³", "preset:volume:80"),
+        ],
+        "price": [
+            ("20 грн/км", "preset:price:20"),
+            ("25 грн/км", "preset:price:25"),
+            ("30 грн/км", "preset:price:30"),
+            ("+5 грн/км", "preset:price:+5"),
+        ],
+    }
+    titles = {
+        "weight": "⚖️ <b>Мінімальна маса</b>",
+        "volume": "📐 <b>Мінімальний об'єм</b>",
+        "price": "💵 <b>Мінімальна ставка / км</b>",
+    }
+    rows = []
+    items = presets[kind]
+    for offset in range(0, len(items), 2):
+        rows.append([InlineKeyboardButton(text=items[offset][0], callback_data=items[offset][1])] + (
+            [InlineKeyboardButton(text=items[offset + 1][0], callback_data=items[offset + 1][1])]
+            if offset + 1 < len(items) else []
+        ))
+    rows.extend([
+        [InlineKeyboardButton(text="✏️ Ввести вручну", callback_data=f"custom:{kind}")],
+        [InlineKeyboardButton(text="🗑 Очистити", callback_data=f"preset:clear:{kind}")],
+        [InlineKeyboardButton(text="↩️ До фільтра", callback_data="cfg")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+
 def config_menu(filter_data: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -600,6 +704,10 @@ def config_menu(filter_data: Dict[str, Any]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🚛 Тип транспорту", callback_data="transport")],
             [InlineKeyboardButton(text="💵 Мін. ставка / км", callback_data="val:price")],
             [InlineKeyboardButton(text="🔥 Гаряча ставка", callback_data="val:hot_price")],
+            [InlineKeyboardButton(
+                text=("📋 Неповні дані: ТАК" if filter_data.get("allow_incomplete_data") else "📋 Неповні дані: НІ"),
+                callback_data="incomplete_toggle",
+            )],
             [InlineKeyboardButton(
                 text=("🔄 Зворотний: ON" if filter_data.get("return_search_enabled") else "🔄 Зворотний: OFF"),
                 callback_data="return_toggle_cfg",
@@ -697,7 +805,9 @@ def render_filter(filter_data: Dict[str, Any]) -> str:
         f"📏 <b>Габарити:</b> дов {html.escape(range_text('min_length', 'max_length', 'м'))}; шир {html.escape(range_text('min_width', 'max_width', 'м'))}; вис {html.escape(range_text('min_height', 'max_height', 'м'))}\n"
         f"🚛 <b>Транспорт:</b> {html.escape(', '.join(transports) if transports else 'будь-який')}\n\n"
         f"💵 <b>Мін. ставка:</b> {filter_data.get('min_price_km') if filter_data.get('min_price_km') is not None else 'будь-яка'} грн/км\n"
-        f"🔥 <b>Гаряча ставка:</b> {html.escape(hot_text)}\n\n"
+        f"🔥 <b>Гаряча ставка:</b> {html.escape(hot_text)}\n"
+        f"📋 <b>Неповні дані:</b> "
+        f"{'показувати' if filter_data.get('allow_incomplete_data') else 'не показувати'}\n\n"
         f"🔄 <b>Зворотний пошук:</b> {'увімкнений' if filter_data.get('return_search_enabled') else 'вимкнений'}\n"
         f"🚛 <b>Тільки туди + назад:</b> {'так' if filter_data.get('round_trip_only') else 'ні'}"
     )
@@ -807,6 +917,22 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Готово")
         return
 
+    if data == "incomplete_toggle":
+        filter_data["allow_incomplete_data"] = not bool(filter_data.get("allow_incomplete_data"))
+        await state.update_data(filter=filter_data)
+        await callback.message.edit_text(
+            render_filter(filter_data),
+            parse_mode="HTML",
+            reply_markup=config_menu(filter_data),
+        )
+        await callback.answer(
+            "Показ неповних даних увімкнено"
+            if filter_data["allow_incomplete_data"]
+            else "Показ неповних даних вимкнено"
+        )
+        return
+
+
     if data in {"return_toggle", "return_toggle_cfg"}:
         if data == "return_toggle":
             filter_data = await get_saved_filter(chat_id)
@@ -896,31 +1022,84 @@ async def callbacks(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(render_filter(filter_data), parse_mode="HTML", reply_markup=location_menu(side, filter_data))
         await callback.answer()
         return
+    
+    if data in {"val:weight", "val:volume", "val:price"}:
+        kind = data.split(":", 1)[1]
+        titles = {
+            "weight": "⚖️ <b>Виберіть мінімальну масу</b>",
+            "volume": "📐 <b>Виберіть мінімальний об'єм</b>",
+            "price": "💵 <b>Виберіть мінімальну ставку / км</b>",
+        }
+        await callback.message.edit_text(
+            titles[kind],
+            parse_mode="HTML",
+            reply_markup=numeric_preset_menu(kind),
+        )
+        await callback.answer()
+        return
+    
+    if data.startswith("preset:"):
+        _, action, raw_value = (data.split(":", 2) + [""])[:3]
+        if action == "clear":
+            if raw_value == "weight":
+                filter_data["min_weight"] = None
+                filter_data["max_weight"] = None
+            elif raw_value == "volume":
+                filter_data["min_volume"] = None
+                filter_data["max_volume"] = None
+            elif raw_value == "price":
+                filter_data["min_price_km"] = None
+            else:
+                await callback.answer("Невідомий preset", show_alert=True)
+                return
+        elif action == "weight":
+            filter_data["min_weight"] = safe_float(raw_value)
+            filter_data["max_weight"] = None
+        elif action == "volume":
+            filter_data["min_volume"] = safe_float(raw_value)
+            filter_data["max_volume"] = None
+        elif action == "price":
+            if raw_value == "+5":
+                filter_data["min_price_km"] = (filter_data.get("min_price_km") or 0) + 5
+            else:
+                filter_data["min_price_km"] = safe_float(raw_value)
+        else:
+            await callback.answer("Невідомий preset", show_alert=True)
+            return
 
-    if data == "val:weight":
+        await state.update_data(filter=filter_data)
+        await callback.message.edit_text(
+            render_filter(filter_data),
+            parse_mode="HTML",
+            reply_markup=config_menu(filter_data),
+        )
+        await callback.answer("Значення встановлено")
+        return
+
+    if data.startswith("custom:"):
+        kind = data.split(":", 1)[1]
+        if kind not in {"weight", "volume", "price"}:
+            await callback.answer("Невідомий режим", show_alert=True)
+            return
         await state.set_state(FilterWizard.waiting_value)
-        await state.update_data(filter=filter_data, input_kind="weight")
-        await callback.message.answer("⚖️ Введіть <code>мін;макс</code> у тоннах.\nНаприклад: <code>5;20</code> або <code>5;</code> або <code>;20</code>.", parse_mode="HTML")
+        await state.update_data(filter=filter_data, input_kind=kind)
+        prompts = {
+            "weight": "⚖️ Введіть <code>мін;макс</code> у тоннах. Наприклад: <code>5;20</code>.",
+            "volume": "📐 Введіть <code>мін;макс</code> у м³. Наприклад: <code>20;80</code>.",
+            "price": "💵 Введіть мінімальну ставку грн/км. Для вимкнення — <code>0</code>.",
+        }
+        await callback.message.answer(prompts[kind], parse_mode="HTML")
         await callback.answer()
         return
-    if data == "val:volume":
-        await state.set_state(FilterWizard.waiting_value)
-        await state.update_data(filter=filter_data, input_kind="volume")
-        await callback.message.answer("📐 Введіть <code>мін;макс</code> у м³.\nНаприклад: <code>20;80</code>.", parse_mode="HTML")
-        await callback.answer()
-        return
+
+        
+    
     if data in {"val:length", "val:width", "val:height"}:
         labels = {"val:length": ("довжину", "м"), "val:width": ("ширину", "м"), "val:height": ("висоту", "м")}
         label, unit = labels[data]
         await state.set_state(FilterWizard.waiting_value)
         await state.update_data(filter=filter_data, input_kind=data.split(":", 1)[1])
         await callback.message.answer(f"📏 Введіть <code>мін;макс</code> у {unit} для {label}.\nНаприклад: <code>2;4</code>.", parse_mode="HTML")
-        await callback.answer()
-        return
-    if data == "val:price":
-        await state.set_state(FilterWizard.waiting_value)
-        await state.update_data(filter=filter_data, input_kind="price")
-        await callback.message.answer("💵 Введіть мінімальну ставку грн/км. Для вимкнення — <code>0</code>.", parse_mode="HTML")
         await callback.answer()
         return
 

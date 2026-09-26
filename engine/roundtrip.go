@@ -61,16 +61,28 @@ func findReturnCargo(ctx context.Context, db *pgxpool.Pool, forward *CargoPayloa
 		} {
 			if item.min > 0 {
 				args = append(args, item.min)
-				extra = append(extra, fmt.Sprintf("%s >= $%d", item.col, len(args)))
+				if filter.AllowIncompleteData {
+					extra = append(extra, fmt.Sprintf("(%s IS NULL OR %s <= 0 OR %s >= $%d)", item.col, item.col, item.col, len(args)))
+				} else {
+					extra = append(extra, fmt.Sprintf("%s >= $%d", item.col, len(args)))
+				}
 			}
 			if item.max > 0 {
 				args = append(args, item.max)
-				extra = append(extra, fmt.Sprintf("%s IS NOT NULL AND %s <= $%d", item.col, item.col, len(args)))
+				if filter.AllowIncompleteData {
+					extra = append(extra, fmt.Sprintf("(%s IS NULL OR %s <= 0 OR %s <= $%d)", item.col, item.col, item.col, len(args)))
+				} else {
+					extra = append(extra, fmt.Sprintf("%s IS NOT NULL AND %s <= $%d", item.col, item.col, len(args)))
+				}
 			}
 		}
 		if filter.MinPricePerKm > 0 {
 			args = append(args, filter.MinPricePerKm)
-			extra = append(extra, fmt.Sprintf("price_per_km_uah >= $%d", len(args)))
+			if filter.AllowIncompleteData {
+				extra = append(extra, fmt.Sprintf("(price_per_km_uah IS NULL OR price_per_km_uah <= 0 OR price_per_km_uah >= $%d)", len(args)))
+			} else {
+				extra = append(extra, fmt.Sprintf("price_per_km_uah >= $%d", len(args)))
+			}
 		}
 		if len(filter.TransportTypes) > 0 {
 			args = append(args, filter.TransportTypes)

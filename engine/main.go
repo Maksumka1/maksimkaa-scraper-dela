@@ -21,7 +21,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const filterSchemaVersion = 3
+const filterSchemaVersion = 4
 
 type UserFilter struct {
 	ChatID int64
@@ -51,6 +51,7 @@ type UserFilter struct {
 	HotMinPricePerKm float64
 
 	TransportTypes      []string
+	AllowIncompleteData bool
 	ReturnSearchEnabled bool
 	RoundTripOnly       bool
 	Enabled             bool
@@ -800,14 +801,20 @@ func match(c *CargoPayload, f *UserFilter) bool {
 		{f.MinHeight, f.MaxHeight, c.HeightM},
 	} {
 		if item.min > 0 && item.value < item.min {
-			return false
+			if !(f.AllowIncompleteData && item.value <= 0) {
+				return false
+			}
 		}
 		if item.max > 0 && (item.value <= 0 || item.value > item.max) {
-			return false
+			if !(f.AllowIncompleteData && item.value <= 0) {
+				return false
+			}
 		}
 	}
 	if f.MinPricePerKm > 0 && c.PricePerKmUAH < f.MinPricePerKm {
-		return false
+		if !(f.AllowIncompleteData && c.PricePerKmUAH <= 0) {
+			return false
+		}
 	}
 	if len(f.TransportTypes) > 0 && !hasTransportIntersection(c.TransportTypes, f.TransportTypes) {
 		return false
@@ -897,7 +904,7 @@ func formatPublishedTime(value string) string {
 
 func formatTags(tags []string) string {
 	if len(tags) == 0 {
-		return "🏷 <code>Теги не вказані</code>"
+		return "🏷️ <code>Теги не вказані</code>"
 	}
 	parts := make([]string, 0, len(tags))
 	for _, tag := range tags {
@@ -905,12 +912,12 @@ func formatTags(tags []string) string {
 		if tag == "" {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("<code>%s</code>", escapeTelegramHTML(strings.ToUpper(tag))))
+		parts = append(parts, fmt.Sprintf("🏷️ <code>[%s]</code>", escapeTelegramHTML(tag)))
 	}
 	if len(parts) == 0 {
-		return "🏷 <code>Теги не вказані</code>"
+		return "🏷️ <code>Теги не вказані</code>"
 	}
-	return "🏷 " + strings.Join(parts, " ")
+	return strings.Join(parts, " ")
 }
 
 func formatAlert(c *CargoPayload, f *UserFilter) string {
@@ -992,6 +999,7 @@ func buildUserFilter(chatID int64, data map[string]string) *UserFilter {
 		MinPricePerKm:       parseFloatField(data, "min_price_km"),
 		HotMinPricePerKm:    hotMinPriceKm,
 		TransportTypes:      parseStringSlice(data["transport_types"]),
+		AllowIncompleteData: parseBoolField(data, "allow_incomplete_data"),
 		ReturnSearchEnabled: parseBoolField(data, "return_search_enabled"),
 		RoundTripOnly:       parseBoolField(data, "round_trip_only"),
 		Enabled:             parseBoolField(data, "enabled"),
